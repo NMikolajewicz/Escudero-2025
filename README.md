@@ -8,7 +8,7 @@ Escudero B., ..., Singh S. (2025) *in preparation.*
 The scripts used to generate figures/results in the current manuscript are provided in this repository. All data are publicly available or may be obtained from authors upon reasonable request.
 
 - scRNA-seq NMF program identification `MB_01_discovery.Rmd`
-- Bulk RNA-seq drug treatment validation `MB_03_bulkRNAseq.Rmd`
+- Bulk RNA-seq drug treatment `MB_03_bulkRNAseq.Rmd`
 - CSF proteomics (Kim et al. 2024) `MB_03_CSF_Kim2024.Rmd`
 - Proteomic vs. RNA-seq comparisons (Archer 2018) `MB_04_Proteomics_vs_RNA_Archer2018.Rmd`
 

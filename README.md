@@ -9,7 +9,8 @@ The scripts used to generate figures/results in the current manuscript are provi
 
 - scRNA-seq NMF program identification `MB_01_discovery.Rmd`
 - Bulk RNA-seq drug treatment validation `MB_03_bulkRNAseq.Rmd`
-- CSF proteomics patient validation `MB_03_CSF.Rmd`
+- CSF proteomics (Kim et al. 2024) `MB_03_CSF_Kim2024.Rmd`
+- Proteomic vs. RNA-seq comparisons (Archer 2018) `MB_04_Proteomics_vs_RNA_Archer2018.Rmd`
 
 ## Installation Guide
 

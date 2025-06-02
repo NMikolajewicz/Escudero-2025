@@ -1,0 +1,926 @@
+---
+title: "Medulloblastoma Multi-Omics Validation Analysis"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+---
+
+# Medulloblastoma RNA-seq and Proteomics Validation Analysis
+# Dataset: Archer et al. 2018 Cancer Cell
+# This script compares RNA and protein expression in medulloblastoma
+# Author: N. Mikolajewicz
+
+# ==============================================================================
+# SETUP AND DEPENDENCIES
+# ==============================================================================
+
+```{r setup, include=FALSE}
+# Clear environment and start timer
+rm(list = setdiff(ls(), c("data.path", "user")))
+invisible({gc()})
+start.time <- proc.time()
+
+# Load required packages
+packages_to_load <- c(
+  "Seurat", "sctransform", "Libra",
+  "dplyr", "tidyr", "RColorBrewer", "ggplot2", "gridExtra", 
+  "DT", "flexdashboard", "future", "biomaRt", "foreach", 
+  "parallel", "doParallel", "scMiko", "reshape2", "glmGamPoi",
+  "readxl", "cowplot"
+)
+
+# Check for missing packages
+missing_packages <- packages_to_load[!packages_to_load %in% installed.packages()[,"Package"]]
+if(length(missing_packages)) {
+  cat("Installing missing packages:", paste(missing_packages, collapse = ", "), "\n")
+  install.packages(missing_packages)
+}
+
+# Load packages
+invisible({lapply(packages_to_load, library, character.only = TRUE)})
+```
+
+```{r config}
+# Set paths and analysis parameters
+base_dir <- "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Medulloblastoma/Archer_2018_Proteomics/"
+
+# Analysis parameters
+detection_threshold <- 0.7  # Gene/protein detection threshold
+significance_threshold <- 0.05  # P-value threshold for differential expression
+fold_change_threshold <- 0.1  # Log fold change threshold
+n_variable_features <- 2000  # Number of variable features for analysis
+
+# Load NMF programs from previous scRNA-seq analysis
+nmf_programs_file <- "MB_nmf_programs_120225.rds"
+if (file.exists(nmf_programs_file)) {
+  nmf_robust_final <- readRDS(nmf_programs_file)
+  cat("Loaded NMF programs from scRNA-seq analysis\n")
+  cat("Programs loaded:", paste(names(nmf_robust_final), collapse = ", "), "\n")
+} else {
+  cat("Warning: NMF programs file not found. Using hardcoded programs.\n")
+  # Hardcoded NMF programs as backup from previous analyses
+  nmf_robust_final <- list(
+    G1 = c('ASPM', 'AURKB', 'BUB1', 'BUB1B', 'CDC25C', 'CDCA2', 'CKAP2L', 
+           'DLGAP5', 'ESCO2', 'ESPL1', 'GTSE1', 'KIF20A', 'KIF23', 'KIF2C', 
+           'KIFC1', 'MKI67', 'NDC80', 'PBK', 'TACC3', 'TROAP', 'TTK'),
+    G2 = c('ATP5F1E', 'BTF3', 'CHCHD2', 'COMMD6', 'COX7A2', 'COX7C', 'EEF1A1', 
+           'ELOB', 'FAU', 'FTH1', 'FTL', 'GAPDH', 'H3F3A', 'HINT1', 'HNRNPA1', 
+           'NACA', 'NDUFS5', 'RACK1', 'SLC25A6', 'SUMO2', 'TMA7', 'TMSB10', 
+           'TMSB4X', 'TPT1', 'UBA52', 'UQCRH', 'YBX1'),
+    G3 = c('CABP5', 'CNGA1', 'CNGB1', 'CPLX4', 'GABRR3', 'GNAT1', 'GNGT1', 
+           'GNGT2', 'GPR160', 'IMPG1', 'KCNV2', 'LMOD1', 'MATK', 'NR2E3', 
+           'PDC', 'PDE6A', 'PDE6B', 'PDE6G', 'PLEKHB1', 'PRCD', 'PRPH2', 
+           'RASSF2', 'RAX2', 'RBP3', 'RCVRN', 'RDH12', 'REEP6', 'ROM1', 
+           'Rp1', 'RTBDN', 'SAG', 'SLC6A17', 'SNCB')
+  )
+}
+
+# Print program sizes
+for(i in 1:length(nmf_robust_final)) {
+  cat("  ", names(nmf_robust_final)[i], ":", length(nmf_robust_final[[i]]), "genes\n")
+}
+```
+
+# ==============================================================================
+# DATA IMPORT AND PREPROCESSING
+# ==============================================================================
+
+```{r data_import}
+# Load multi-omics data from Archer et al. 2018 Cancer Cell
+cat("Loading Archer et al. 2018 multi-omics data...\n")
+
+# Load sample metadata
+metadata <- tryCatch({
+  meta <- readxl::read_xlsx(paste0(base_dir, "Archer_2018_Cancer_Cell_Metadata.xlsx"))
+  colnames(meta)[1] <- "sample"
+  meta <- col2rowname(meta, "sample")
+  meta$sample <- rownames(meta)
+  meta
+}, error = function(e) {
+  stop("Failed to load metadata file. Please check file path and format.")
+})
+
+# Load proteomics data
+protein_data <- tryCatch({
+  prot <- readxl::read_xlsx(
+    paste0(base_dir, "Archer_2018_Cancer_Cell_Proteomics_RNA_Data.xlsx"), 
+    sheet = "Proteomics"
+  )
+  
+  # Clean proteomics data
+  prot <- prot %>% 
+    dplyr::select(-c("entry_name", "accession_number")) %>%
+    col2rowname("geneSymbol")
+  
+  # Remove rows with missing data
+  prot <- prot[complete.cases(prot), ]
+  prot
+}, error = function(e) {
+  stop("Failed to load proteomics data. Please check file path and sheet name.")
+})
+
+# Load RNA-seq data
+rna_data <- tryCatch({
+  rna <- readxl::read_xlsx(
+    paste0(base_dir, "Archer_2018_Cancer_Cell_Proteomics_RNA_Data.xlsx"), 
+    sheet = "RNA-seq"
+  )
+  
+  # Clean RNA-seq data
+  rna <- rna %>%
+    col2rowname("Transcript / Genesym")
+  
+  # Remove rows with missing data
+  rna <- rna[complete.cases(rna), ]
+  rna
+}, error = function(e) {
+  stop("Failed to load RNA-seq data. Please check file path and sheet name.")
+})
+
+cat("Data loaded successfully!\n")
+cat("Initial data dimensions:\n")
+cat("- Proteomics:", nrow(protein_data), "proteins x", ncol(protein_data), "samples\n")
+cat("- RNA-seq:", nrow(rna_data), "genes x", ncol(rna_data), "samples\n")
+cat("- Metadata:", nrow(metadata), "samples\n")
+```
+
+```{r data_harmonization}
+# Harmonize datasets to common genes and samples
+cat("Harmonizing multi-omics datasets...\n")
+
+# Find common genes between RNA and protein data
+common_genes <- intersect(rownames(protein_data), rownames(rna_data))
+cat("Common genes between RNA and protein data:", length(common_genes), "\n")
+
+# Subset to common genes
+protein_data_filtered <- protein_data[common_genes, ]
+rna_data_filtered <- rna_data[common_genes, ]
+
+# Find common samples across all datasets
+common_samples <- Reduce(intersect, list(
+  colnames(protein_data_filtered),
+  colnames(rna_data_filtered),
+  rownames(metadata)
+))
+cat("Common samples across all datasets:", length(common_samples), "\n")
+
+# Subset all datasets to common samples
+protein_data_final <- protein_data_filtered[, common_samples]
+rna_data_final <- rna_data_filtered[, common_samples]
+metadata_final <- metadata[common_samples, ]
+
+# Data integrity checks
+stopifnot("Gene names must be unique in protein data" = 
+          length(unique(rownames(protein_data_final))) == nrow(protein_data_final))
+stopifnot("Gene names must be unique in RNA data" = 
+          length(unique(rownames(rna_data_final))) == nrow(rna_data_final))
+stopifnot("Sample names must match across datasets" = 
+          all(colnames(protein_data_final) == colnames(rna_data_final)))
+stopifnot("Sample names must match metadata" = 
+          all(colnames(protein_data_final) == rownames(metadata_final)))
+
+cat("Final harmonized datasets:\n")
+cat("- Genes:", nrow(protein_data_final), "\n")
+cat("- Samples:", ncol(protein_data_final), "\n")
+cat("- Sample types:", paste(unique(metadata_final$type), collapse = ", "), "\n")
+
+# Print sample distribution by subtype
+if("Medulloblastoma.Consensus.Subgroup" %in% colnames(metadata_final)) {
+  subtype_counts <- table(metadata_final$Medulloblastoma.Consensus.Subgroup)
+  cat("Sample distribution by MB subtype:\n")
+  print(subtype_counts)
+}
+```
+
+# ==============================================================================
+# SEURAT OBJECT CREATION AND QUALITY CONTROL
+# ==============================================================================
+
+```{r seurat_creation}
+# Create Seurat objects for multi-omics analysis
+cat("Creating Seurat objects for multi-omics analysis...\n")
+
+# Create proteomics Seurat object
+seurat_protein <- CreateSeuratObject(
+  counts = protein_data_final, 
+  meta.data = metadata_final,
+  project = "MB_Proteomics"
+)
+
+# Create RNA-seq Seurat object
+seurat_rna <- CreateSeuratObject(
+  counts = rna_data_final, 
+  meta.data = metadata_final,
+  project = "MB_RNAseq"
+)
+
+# Standardize subtype annotation
+if("Medulloblastoma.Consensus.Subgroup" %in% colnames(metadata_final)) {
+  seurat_protein@meta.data$subtype <- seurat_protein@meta.data$Medulloblastoma.Consensus.Subgroup
+  seurat_rna@meta.data$subtype <- seurat_rna@meta.data$Medulloblastoma.Consensus.Subgroup
+} else {
+  # Fallback to type if consensus subgroup not available
+  seurat_protein@meta.data$subtype <- seurat_protein@meta.data$type
+  seurat_rna@meta.data$subtype <- seurat_rna@meta.data$type
+}
+
+cat("Created Seurat objects:\n")
+cat("- Proteomics:", ncol(seurat_protein), "samples x", nrow(seurat_protein), "proteins\n")
+cat("- RNA-seq:", ncol(seurat_rna), "samples x", nrow(seurat_rna), "genes\n")
+
+```
+
+# ==============================================================================
+# SEURAT PREPROCESSING PIPELINE
+# ==============================================================================
+
+```{r seurat_preprocessing}
+# Standardized preprocessing function for both RNA and protein data
+preprocess_seurat <- function(seurat_obj, data_type = "Unknown") {
+  cat("Preprocessing", data_type, "data...\n")
+  
+  # Find variable features
+  seurat_obj <- FindVariableFeatures(
+    seurat_obj, 
+    selection.method = "vst", 
+    nfeatures = min(n_variable_features, nrow(seurat_obj))
+  )
+  
+  cat("  - Variable features identified:", length(VariableFeatures(seurat_obj)), "\n")
+  
+  # Scale data
+  all_features <- rownames(seurat_obj)
+  seurat_obj <- ScaleData(seurat_obj, features = all_features)
+  
+  # Principal Component Analysis
+  n_pcs <- min(50, ncol(seurat_obj) - 1, nrow(seurat_obj) - 1)
+  seurat_obj <- RunPCA(
+    seurat_obj, 
+    features = VariableFeatures(seurat_obj), 
+    npcs = n_pcs,
+    verbose = FALSE
+  )
+  
+  # Calculate PCA variance explained
+  pca_variance <- propVarPCA(seurat_obj)
+  cat("  - PCA completed. Top 2 PCs explain", 
+      round(sum(pca_variance$var.explained[1:2]), 1), "% variance\n")
+  
+  # Clustering and UMAP
+  n_dims <- min(30, n_pcs)
+  seurat_obj <- FindNeighbors(seurat_obj, dims = 1:n_dims, verbose = FALSE)
+  seurat_obj <- FindClusters(seurat_obj, resolution = 0.5, verbose = FALSE)
+  seurat_obj <- RunUMAP(seurat_obj, dims = 1:n_dims, verbose = FALSE)
+  
+  cat("  - Clustering completed. Found", length(unique(seurat_obj$seurat_clusters)), "clusters\n")
+  
+  return(seurat_obj)
+}
+
+# Preprocess both datasets
+seurat_protein <- preprocess_seurat(seurat_protein, "Proteomics")
+seurat_rna <- preprocess_seurat(seurat_rna, "RNA-seq")
+
+seurat_protein@meta.data$subtype <- seurat_protein@meta.data[["Medulloblastoma.Consensus.Subgroup"]]
+seurat_rna@meta.data$subtype <- seurat_rna@meta.data[["Medulloblastoma.Consensus.Subgroup"]]
+
+cat("Preprocessing completed for both datasets.\n")
+```
+
+# ==============================================================================
+# MULTI-OMICS VISUALIZATION AND COMPARISON
+# ==============================================================================
+
+```{r multiomics_visualization, fig.width=10, fig.height=4}
+# Create comprehensive visualization comparing RNA and protein data
+cat("Creating multi-omics visualizations...\n")
+
+# UMAP comparison by subtype
+umap_protein <- cluster.UMAP(seurat_protein, "subtype", pt.size = 2) + 
+  labs(title = "Proteomics", subtitle = "UMAP by MB Subtype") +
+  theme_miko(legend = TRUE)
+
+umap_rna <- cluster.UMAP(seurat_rna, "subtype", pt.size = 2) + 
+  labs(title = "RNA-seq", subtitle = "UMAP by MB Subtype") +
+  theme_miko(legend = TRUE)
+
+# Combine UMAP plots
+umap_comparison <- cowplot::plot_grid(
+  umap_protein, umap_rna, 
+  nrow = 1, 
+  align = "hv"
+)
+
+print(umap_comparison)
+
+# Variable features comparison
+protein_var_genes <- VariableFeatures(seurat_protein)
+rna_var_genes <- VariableFeatures(seurat_rna)
+common_var_genes <- intersect(protein_var_genes, rna_var_genes)
+
+cat("Variable features comparison:\n")
+cat("- Protein variable features:", length(protein_var_genes), "\n")
+cat("- RNA variable features:", length(rna_var_genes), "\n")
+cat("- Common variable features:", length(common_var_genes), "\n")
+cat("- Overlap percentage:", round(length(common_var_genes) / 
+    length(union(protein_var_genes, rna_var_genes)) * 100, 1), "%\n")
+```
+
+# ==============================================================================
+# NMF PROGRAM ACTIVITY SCORING
+# ==============================================================================
+
+```{r nmf_program_scoring, fig.width=8, fig.height=3.5}
+# Score NMF programs across both RNA and protein data
+cat("Scoring NMF programs in multi-omics data...\n")
+
+# Calculate module scores for proteomics data
+ms_protein <- runMS(object = seurat_protein, genelist = nmf_robust_final, return.plots = FALSE)
+ms_protein_data <- ms_protein$data
+ms_protein_data$subtype <- seurat_protein@meta.data$subtype
+ms_protein_data$sample_id <- rownames(ms_protein_data)
+
+# Calculate module scores for RNA-seq data
+ms_rna <- runMS(object = seurat_rna, genelist = nmf_robust_final, return.plots = FALSE)
+ms_rna_data <- ms_rna$data
+ms_rna_data$subtype <- seurat_rna@meta.data$subtype
+ms_rna_data$sample_id <- rownames(ms_rna_data)
+
+# Prepare data for visualization
+program_names <- names(nmf_robust_final)
+
+# Proteomics program activity
+protein_program_data <- ms_protein_data %>% 
+  dplyr::select(all_of(c(program_names, "subtype", "sample_id"))) %>%
+  pivot_longer(
+    cols = all_of(program_names),
+    names_to = "nmf_program",
+    values_to = "activity_score"
+  ) %>%
+  mutate(data_type = "Proteomics")
+
+# RNA-seq program activity
+rna_program_data <- ms_rna_data %>% 
+  dplyr::select(all_of(c(program_names, "subtype", "sample_id"))) %>%
+  pivot_longer(
+    cols = all_of(program_names),
+    names_to = "nmf_program", 
+    values_to = "activity_score"
+  ) %>%
+  mutate(data_type = "RNA-seq")
+
+# Create comparison plots
+protein_program_plot <- protein_program_data %>%
+  ggplot(aes(x = nmf_program, y = activity_score, fill = nmf_program)) + 
+  geom_boxplot(alpha = 0.7) + 
+  ggbeeswarm::geom_quasirandom(alpha = 0.6, size = 1) + 
+  facet_wrap(~subtype, scales = "free_y") + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  scale_fill_brewer(type = "qual", palette = "Set2") +
+  labs(
+    x = "NMF Program", 
+    y = "Program Activity Score", 
+    title = "NMF Program Activity - Proteomics",
+    subtitle = "scRNA-seq derived programs in proteomics data"
+  ) +
+  theme_miko(fill.palette = "ptol") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(fill = "none")
+
+rna_program_plot <- rna_program_data %>%
+  ggplot(aes(x = nmf_program, y = activity_score, fill = nmf_program)) + 
+  geom_boxplot(alpha = 0.7) + 
+  ggbeeswarm::geom_quasirandom(alpha = 0.6, size = 1) + 
+  facet_wrap(~subtype, scales = "free_y") + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  scale_fill_brewer(type = "qual", palette = "Set2") +
+  labs(
+    x = "NMF Program", 
+    y = "Program Activity Score", 
+    title = "NMF Program Activity - RNA-seq",
+    subtitle = "scRNA-seq derived programs in bulk RNA-seq data"
+  ) +
+  theme_miko(fill.palette = "ptol") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(fill = "none")
+
+# Display individual plots
+print(protein_program_plot)
+print(rna_program_plot)
+
+
+cat("NMF Program Activity Statistics:\n")
+print(program_stats)
+```
+
+```{r rna_protein_correlation, fig.width=6, fig.height=5}
+# Correlation analysis between RNA and protein program activities
+cat("Analyzing RNA-protein correlations for NMF programs...\n")
+
+# Merge protein and RNA program data
+colnames(protein_program_data)[colnames(protein_program_data) == "activity_score"] <- "protein_activity"
+colnames(rna_program_data)[colnames(rna_program_data) == "activity_score"] <- "rna_activity"
+
+correlation_data <- merge(
+  protein_program_data[, c("sample_id", "nmf_program", "subtype", "protein_activity")],
+  rna_program_data[, c("sample_id", "nmf_program", "rna_activity")],
+  by = c("sample_id", "nmf_program")
+)
+
+# Calculate correlations
+correlation_stats <- correlation_data %>%
+  dplyr::group_by(nmf_program, subtype) %>%
+  dplyr::summarise(
+    correlation = cor(rna_activity, protein_activity, use = "complete.obs"),
+    p_value = tryCatch({
+      cor.test(rna_activity, protein_activity)$p.value
+    }, error = function(e) NA),
+    n_samples = n(),
+    .groups = 'drop'
+  ) %>%
+  dplyr::mutate(
+    correlation_strength = case_when(
+      abs(correlation) >= 0.7 ~ "Strong",
+      abs(correlation) >= 0.4 ~ "Moderate", 
+      TRUE ~ "Weak"
+    )
+  )
+
+# Create correlation plot
+rna_protein_correlation_plot <- correlation_data %>%
+  ggplot(aes(x = rna_activity, y = protein_activity)) + 
+  geom_point(alpha = 0.6, size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_smooth(method = "lm", se = TRUE, color = "red", alpha = 0.3) + 
+  facet_grid(subtype ~ nmf_program, scales = "free") + 
+  labs(
+    x = "RNA Program Activity", 
+    y = "Protein Program Activity",
+    title = "RNA vs Protein NMF Program Activity",
+    subtitle = "Correlation analysis across MB subtypes"
+  ) +
+  theme_miko()
+
+print(rna_protein_correlation_plot)
+
+# Display correlation statistics
+cat("RNA-Protein Correlation Statistics:\n")
+print(correlation_stats)
+
+# Summary correlation plot
+correlation_summary_plot <- correlation_stats %>%
+  ggplot(aes(x = nmf_program, y = subtype, fill = correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(correlation, 2)), color = "white", fontface = "bold") +
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red",
+    midpoint = 0, limit = c(-1, 1),
+    name = "Correlation"
+  ) +
+  labs(
+    x = "NMF Program",
+    y = "MB Subtype", 
+    title = "RNA-Protein Correlation Heatmap",
+    subtitle = "Pearson correlation coefficients"
+  ) +
+  theme_miko() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(correlation_summary_plot)
+
+
+```
+
+# ==============================================================================
+# METABOLIC PATHWAY ANALYSIS
+# ==============================================================================
+
+```{r metabolic_pathway_analysis, fig.width=6, fig.height=4}
+# Analyze purine and pyrimidine metabolism pathways
+cat("Analyzing metabolic pathways in multi-omics data...\n")
+
+# Get KEGG pathway gene sets
+symbol_to_entrez <- sym2entrez(rownames(seurat_protein), my.species = "Hs")
+symbol_to_entrez <- symbol_to_entrez[complete.cases(symbol_to_entrez), ]
+
+entrez_to_symbol <- symbol_to_entrez$SYMBOL
+names(entrez_to_symbol) <- as.character(symbol_to_entrez$ENTREZID)
+
+# Get KEGG pathways
+kegg_pathways <- getAnnotationPathways(
+  query.genes = symbol_to_entrez$ENTREZID, 
+  db = 'KEGG'
+)
+
+kegg_pathways <- lapply(kegg_pathways, function(x) {
+  symbols <- entrez_to_symbol[as.character(x)]
+  symbols[!is.na(symbols)]
+})
+
+# Focus on nucleotide metabolism pathways
+metabolism_pathways <- list(
+  purine_metabolism = kegg_pathways$KEGG_PURINE_METABOLISM,
+  pyrimidine_metabolism = kegg_pathways$KEGG_PYRIMIDINE_METABOLISM
+)
+
+# Remove empty pathways
+metabolism_pathways <- metabolism_pathways[sapply(metabolism_pathways, length) > 0]
+
+cat("Metabolic pathways loaded:\n")
+for(pathway in names(metabolism_pathways)) {
+  cat("  -", pathway, ":", length(metabolism_pathways[[pathway]]), "genes\n")
+}
+
+# Score metabolic pathways in both datasets
+ms_protein_metabolic <- runMS(
+  object = seurat_protein, 
+  genelist = metabolism_pathways, 
+  return.plots = FALSE
+)
+
+ms_rna_metabolic <- runMS(
+  object = seurat_rna, 
+  genelist = metabolism_pathways, 
+  return.plots = FALSE
+)
+
+# Prepare metabolic pathway data
+ms_protein_metabolic$data$subtype <- seurat_protein@meta.data$subtype
+ms_rna_metabolic$data$subtype <- seurat_rna@meta.data$subtype
+ms_protein_metabolic$data$cells <- rownames(ms_protein_metabolic$data)
+ms_rna_metabolic$data$cells <- rownames(ms_rna_metabolic$data)
+
+# Create long-format data for visualization
+protein_metabolic_long <- ms_protein_metabolic$data %>% 
+  dplyr::select(all_of(c(names(metabolism_pathways), "subtype", "cells"))) %>%
+  pivot_longer(
+    cols = names(metabolism_pathways),
+    names_to = "pathway",
+    values_to = "pathway_activity"
+  ) %>%
+  dplyr::mutate(data_type = "Proteomics")
+
+rna_metabolic_long <- ms_rna_metabolic$data %>% 
+  dplyr::select(all_of(c(names(metabolism_pathways), "subtype", "cells"))) %>%
+  pivot_longer(
+    cols = names(metabolism_pathways),
+    names_to = "pathway",
+    values_to = "pathway_activity"
+  ) %>%
+  mutate(data_type = "RNA-seq")
+
+# Metabolic pathway activity plots
+protein_metabolic_plot <- protein_metabolic_long %>%
+  ggplot(aes(x = pathway, y = pathway_activity, fill = pathway)) + 
+  geom_boxplot(alpha = 0.7) + 
+  ggbeeswarm::geom_quasirandom(alpha = 0.6, size = 1) + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  facet_wrap(~subtype, scales = "free_y") + 
+  scale_fill_brewer(type = "qual", palette = "Set1") +
+  labs(
+    x = "Metabolic Pathway", 
+    y = "Pathway Activity Score", 
+    title = "Metabolic Pathway Activity - Proteomics",
+    subtitle = "Nucleotide metabolism in MB subtypes"
+  ) +
+  theme_miko() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(fill = "none")
+
+rna_metabolic_plot <- rna_metabolic_long %>%
+  ggplot(aes(x = pathway, y = pathway_activity, fill = pathway)) + 
+  geom_boxplot(alpha = 0.7) + 
+  ggbeeswarm::geom_quasirandom(alpha = 0.6, size = 1) + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  facet_wrap(~subtype, scales = "free_y") + 
+  scale_fill_brewer(type = "qual", palette = "Set1") +
+  labs(
+    x = "Metabolic Pathway", 
+    y = "Pathway Activity Score", 
+    title = "Metabolic Pathway Activity - RNA-seq",
+    subtitle = "Nucleotide metabolism in MB subtypes"
+  ) +
+  theme_miko() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(fill = "none")
+
+# Display metabolic plots
+print(protein_metabolic_plot)
+print(rna_metabolic_plot)
+
+# Metabolic pathway correlation analysis
+colnames(protein_metabolic_long)[colnames(protein_metabolic_long) == "pathway_activity"] <- "protein_pathway_activity"
+colnames(rna_metabolic_long)[colnames(rna_metabolic_long) == "pathway_activity"] <- "rna_pathway_activity"
+
+metabolic_correlation_data <- merge(
+  protein_metabolic_long[, c("cells", "pathway", "subtype", "protein_pathway_activity")],
+  rna_metabolic_long[, c("cells", "pathway", "rna_pathway_activity")],
+  by = c("cells", "pathway")
+)
+
+metabolic_correlation_plot <- metabolic_correlation_data %>%
+  ggplot(aes(x = rna_pathway_activity, y = protein_pathway_activity)) + 
+  geom_point(alpha = 0.6, size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) + 
+  geom_smooth(method = "lm", se = TRUE, color = "red", alpha = 0.3) + 
+  facet_grid(pathway ~ subtype, scales = "free") + 
+  labs(
+    x = "RNA Pathway Activity", 
+    y = "Protein Pathway Activity",
+    title = "Metabolic Pathway RNA-Protein Correlation",
+    subtitle = "Nucleotide metabolism across MB subtypes"
+  ) +
+  theme_miko()
+
+print(metabolic_correlation_plot)
+
+# Calculate metabolic correlation statistics
+metabolic_correlation_stats <- metabolic_correlation_data %>%
+  dplyr::group_by(pathway, subtype) %>%
+  dplyr::summarise(
+    correlation = cor(rna_pathway_activity, protein_pathway_activity, use = "complete.obs"),
+    p_value = tryCatch({
+      cor.test(rna_pathway_activity, protein_pathway_activity)$p.value
+    }, error = function(e) NA),
+    n_samples = n(),
+    .groups = 'drop'
+  )
+
+cat("Metabolic Pathway Correlation Statistics:\n")
+print(metabolic_correlation_stats)
+```
+
+# ==============================================================================
+# PURINE METABOLISM FOCUSED ANALYSIS
+# ==============================================================================
+
+```{r purine_focused_analysis, fig.width=8, fig.height=5}
+# Focused analysis on purine metabolism proteins
+cat("Performing focused purine metabolism analysis...\n")
+
+# Extract purine metabolism proteins present in the data
+purine_proteins <- rownames(seurat_protein)[
+  rownames(seurat_protein) %in% metabolism_pathways$purine_metabolism
+]
+
+cat("Purine metabolism proteins in dataset:", length(purine_proteins), "\n")
+cat("Proteins:", paste(purine_proteins, collapse = ", "), "\n")
+
+if(length(purine_proteins) >= 5) {
+  # Create purine-focused Seurat objects
+  purine_protein_data <- protein_data_final[purine_proteins, ]
+  purine_rna_data <- rna_data_final[purine_proteins, ]
+  
+  seurat_purine_protein <- CreateSeuratObject(
+    counts = purine_protein_data, 
+    meta.data = metadata_final
+  )
+  
+  seurat_purine_rna <- CreateSeuratObject(
+    counts = purine_rna_data, 
+    meta.data = metadata_final
+  )
+  
+  # Add subtype information
+  seurat_purine_protein@meta.data$subtype <- seurat_protein@meta.data$subtype
+  seurat_purine_rna@meta.data$subtype <- seurat_rna@meta.data$subtype
+  
+  # Process purine metabolism-focused objects
+  process_purine_seurat <- function(seurat_obj, data_type) {
+    cat("Processing purine-focused", data_type, "data...\n")
+    
+    # Use all purine genes as variable features
+    VariableFeatures(seurat_obj) <- rownames(seurat_obj)
+    seurat_obj <- ScaleData(seurat_obj, features = rownames(seurat_obj))
+    
+    # PCA with appropriate number of components
+    n_pcs_purine <- min(length(purine_proteins) - 1, ncol(seurat_obj) - 1)
+    seurat_obj <- RunPCA(seurat_obj, npcs = n_pcs_purine, verbose = FALSE)
+    
+    # Clustering and UMAP
+    seurat_obj <- FindNeighbors(seurat_obj, dims = 1:n_pcs_purine, verbose = FALSE)
+    seurat_obj <- FindClusters(seurat_obj, resolution = 0.5, verbose = FALSE)
+    seurat_obj <- RunUMAP(seurat_obj, dims = 1:n_pcs_purine, verbose = FALSE)
+    
+    return(seurat_obj)
+  }
+  
+  seurat_purine_protein <- process_purine_seurat(seurat_purine_protein, "proteomics")
+  seurat_purine_rna <- process_purine_seurat(seurat_purine_rna, "RNA-seq")
+  
+  # Create purine-focused UMAP plots
+  purine_umap_protein <- cluster.UMAP(seurat_purine_protein, "subtype", pt.size = 3) + 
+    labs(
+      title = "Purine Metabolism - Proteomics", 
+      subtitle = "UMAP based on purine pathway proteins"
+    ) +
+    theme_miko()
+  
+  purine_umap_rna <- cluster.UMAP(seurat_purine_rna, "subtype", pt.size = 3) + 
+    labs(
+      title = "Purine Metabolism - RNA-seq", 
+      subtitle = "UMAP based on purine pathway genes"
+    ) +
+    theme_miko()
+  
+  # Combine purine UMAP plots
+  purine_umap_comparison <- cowplot::plot_grid(
+    purine_umap_protein, purine_umap_rna, 
+    nrow = 1
+  )
+  
+  print(purine_umap_comparison)
+  
+  # Individual purine protein/gene expression analysis
+  purine_expression_data <- data.frame(
+    sample = metadata_final$sample,
+    subtype = metadata_final$`Medulloblastoma Consensus Subgroup`
+    # stringsAsFactors = FALSE
+  )
+  
+  # Add protein expression data
+  for(protein in purine_proteins) {
+    purine_expression_data[[paste0(protein, "_protein")]] <- as.numeric(purine_protein_data[protein, ])
+    purine_expression_data[[paste0(protein, "_rna")]] <- as.numeric(purine_rna_data[protein, ])
+  }
+  
+  # Create correlation matrix for purine proteins
+  purine_protein_matrix <- t(purine_protein_data)
+  purine_rna_matrix <- t(purine_rna_data)
+  
+  purine_correlations <- data.frame(
+    protein = purine_proteins,
+    correlation = sapply(purine_proteins, function(p) {
+      cor(purine_protein_matrix[, p], purine_rna_matrix[, p], use = "complete.obs")
+    }),
+    stringsAsFactors = FALSE
+  )
+  
+  # Purine protein correlation plot
+  purine_correlation_plot <- purine_correlations %>%
+    ggplot(aes(x = reorder(protein, correlation), y = correlation)) +
+    geom_col(aes(fill = correlation > 0), alpha = 0.7) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    coord_flip() +
+    scale_fill_manual(values = c("TRUE" = "darkgreen", "FALSE" = "darkred")) +
+    labs(
+      x = "Purine Metabolism Protein",
+      y = "RNA-Protein Correlation",
+      title = "RNA-Protein Correlation for Purine Metabolism",
+      subtitle = "Individual protein correlations"
+    ) +
+    theme_miko() +
+    guides(fill = "none")
+  
+  print(purine_correlation_plot)
+  
+  cat("Purine metabolism protein correlations:\n")
+  print(purine_correlations)
+  
+} else {
+  cat("Insufficient purine metabolism proteins for focused analysis (", 
+      length(purine_proteins), " < 5)\n")
+}
+
+
+```
+
+
+```{r fig.width=6, fig.height=12}
+
+purine_correlation_plot
+# savePDF("MB04_proteomics_rank_purine_020625.pdf",purine_correlation_plot,fig.width=6, fig.height=12)
+```
+
+# ==============================================================================
+# RESULTS EXPORT AND SUMMARY
+# ==============================================================================
+
+```{r export_results}
+# Export comprehensive analysis results
+output_prefix <- paste0("MB_Archer_multiomics_", format(Sys.Date(), "%d%m%y"))
+
+# Export NMF program scores
+write.csv(
+  ms_protein_data, 
+  file = paste0(output_prefix, "_NMF_scores_proteomics.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  ms_rna_data, 
+  file = paste0(output_prefix, "_NMF_scores_RNAseq.csv"),
+  row.names = FALSE
+)
+
+# Export correlation statistics
+write.csv(
+  correlation_stats, 
+  file = paste0(output_prefix, "_NMF_RNA_protein_correlations.csv"),
+  row.names = FALSE
+)
+
+# Export metabolic pathway scores
+if(exists("ms_protein_metabolic")) {
+  write.csv(
+    ms_protein_metabolic$data, 
+    file = paste0(output_prefix, "_metabolic_scores_proteomics.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    ms_rna_metabolic$data, 
+    file = paste0(output_prefix, "_metabolic_scores_RNAseq.csv"),
+    row.names = FALSE
+  )
+}
+
+# Export metabolic correlation statistics
+if(exists("metabolic_correlation_stats")) {
+  write.csv(
+    metabolic_correlation_stats, 
+    file = paste0(output_prefix, "_metabolic_RNA_protein_correlations.csv"),
+    row.names = FALSE
+  )
+}
+
+# Export purine analysis results
+if(exists("purine_correlations")) {
+  write.csv(
+    purine_correlations, 
+    file = paste0(output_prefix, "_purine_protein_correlations.csv"),
+    row.names = FALSE
+  )
+}
+
+
+# Export harmonized datasets
+write.csv(
+  t(protein_data_final), 
+  file = paste0(output_prefix, "_harmonized_proteomics_data.csv")
+)
+
+write.csv(
+  t(rna_data_final), 
+  file = paste0(output_prefix, "_harmonized_RNAseq_data.csv")
+)
+
+write.csv(
+  metadata_final, 
+  file = paste0(output_prefix, "_harmonized_metadata.csv")
+)
+
+# Generate comprehensive summary
+cat("\n", "="*70, "\n")
+cat("ARCHER ET AL. MULTI-OMICS ANALYSIS SUMMARY\n")
+cat("="*70, "\n")
+cat("Dataset: Archer et al. (2018) Cancer Cell\n")
+cat("Analysis: RNA-seq and Proteomics validation\n")
+
+cat("\nData Summary:\n")
+cat("- Total samples:", ncol(protein_data_final), "\n")
+cat("- Common genes/proteins:", nrow(protein_data_final), "\n")
+cat("- MB subtypes:", paste(unique(metadata_final$subtype), collapse = ", "), "\n")
+
+if(exists("correlation_stats")) {
+  cat("\nNMF Program Validation:\n")
+  for(program in unique(correlation_stats$nmf_program)) {
+    program_cors <- correlation_stats[correlation_stats$nmf_program == program, "correlation"]
+    mean_cor <- mean(program_cors, na.rm = TRUE)
+    cat("- ", program, ": Mean correlation =", round(mean_cor, 3), "\n")
+  }
+}
+
+if(exists("metabolic_correlation_stats")) {
+  cat("\nMetabolic Pathway Validation:\n")
+  for(pathway in unique(metabolic_correlation_stats$pathway)) {
+    pathway_cors <- metabolic_correlation_stats[metabolic_correlation_stats$pathway == pathway, "correlation"]
+    mean_cor <- mean(pathway_cors, na.rm = TRUE)
+    cat("- ", pathway, ": Mean correlation =", round(mean_cor, 3), "\n")
+  }
+}
+
+if(exists("purine_proteins")) {
+  cat("\nPurine Metabolism Analysis:\n")
+  cat("- Purine proteins analyzed:", length(purine_proteins), "\n")
+  if(exists("purine_correlations")) {
+    mean_purine_cor <- mean(purine_correlations$correlation, na.rm = TRUE)
+    cat("- Mean RNA-protein correlation:", round(mean_purine_cor, 3), "\n")
+  }
+}
+
+cat("\nAnalysis completed successfully!\n")
+cat("Total runtime:", round((proc.time() - start.time)[3], 2), "seconds\n")
+```
+
+# ==============================================================================
+# SESSION INFORMATION
+# ==============================================================================
+
+```{r session_info}
+# Record session information for reproducibility
+sessionInfo()
+```

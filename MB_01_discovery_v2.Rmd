@@ -1,0 +1,1145 @@
+---
+title: "Medulloblastoma Gene Program Analysis"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+---
+
+# Medulloblastoma scRNA-seq NMF Gene Program Analysis
+# This script identifies and validates gene programs in medulloblastoma using NMF
+# Author: N. Mikolajewicz
+# Analysis of Hovestadt 2019 and Riemondy 2022 datasets
+
+# ==============================================================================
+# SETUP AND DEPENDENCIES
+# ==============================================================================
+
+```{r setup, include=FALSE}
+# Clear environment and start timer
+rm(list = setdiff(ls(), c("data.path", "user")))
+invisible({gc()})
+start.time <- proc.time()
+
+# Load required packages
+packages_to_load <- c(
+  "Seurat", "sctransform", "Libra",
+  "dplyr", "tidyr", "RColorBrewer", "ggplot2", "gridExtra", 
+  "DT", "flexdashboard", "future", "biomaRt", "foreach", "parallel", 
+  "doParallel", "scMiko", "reshape2", "glmGamPoi"
+)
+invisible({lapply(packages_to_load, library, character.only = TRUE)})
+```
+
+```{r config}
+# Set working directory and paths
+base_dir <- "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/PR_GBM/Papers/non-GBM scRNA-seq papers/"
+```
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+
+```{r helper_functions}
+# Quality control filtering function
+filterData <- function(seurat_obj) {
+  seurat_obj <- getMitoContent(seurat_obj)
+  seurat_obj <- seurat_obj[, seurat_obj@meta.data$percent.mt < 10]
+  seurat_obj <- seurat_obj[, seurat_obj@meta.data$nFeature_RNA < 9000]
+  seurat_obj <- seurat_obj[, seurat_obj@meta.data$nFeature_RNA > 200]
+  return(seurat_obj)
+}
+
+# Normalization function for Seurat object lists
+normDataList <- function(seurat_list, do_filter = TRUE, filter_only = FALSE) {
+  if (do_filter) {
+    # Apply QC filtering
+    seurat_list <- pbapply::pblapply(X = seurat_list, FUN = function(x) {
+      x <- getMitoContent(x)
+      x <- x[, x@meta.data$percent.mt < 10]
+      x <- x[, x@meta.data$nFeature_RNA < 9000]
+      x <- x[, x@meta.data$nFeature_RNA > 200]
+      return(x)
+    })
+    
+    # Remove samples with too few cells
+    seurat_list <- seurat_list[unlist(lapply(seurat_list, ncol)) > 50]
+  }
+  
+  if (!filter_only) {
+    # SCTransform normalization
+    seurat_list <- pbapply::pblapply(X = seurat_list, FUN = function(x) {
+      vars_to_regress <- "percent.mt"
+      object <- tryCatch({
+        SCTransform(x, method = "glmGamPoi", verbose = FALSE, vst.flavor = "v2", 
+                    vars.to.regress = vars_to_regress, variable.features.n = 2000)
+      }, error = function(e) {
+        SCTransform(x, method = "glmGamPoi", verbose = FALSE, 
+                    vars.to.regress = vars_to_regress, variable.features.n = 2000)  
+      }, silent = TRUE)
+      return(object)
+    })
+  }
+  
+  return(seurat_list)
+}
+
+# NMF gene extraction function
+getNMFGenes.dev <- function(feature_loading, norm_cutoff = 0.5, n_cutoff = NA) {
+  if (!("matrix" %in% class(feature_loading))) 
+    stop("feature_loading input is not a matrix")
+  
+  # Calculate normalized loadings
+  nmf_kme <- t(feature_loading)
+  nmf_kme <- (apply(nmf_kme, 2, function(x) ((x^2)/sum(x^2))))
+  
+  # Extract module genes
+  if (!is.na(n_cutoff)) {
+    module_genes <- apply(nmf_kme, 1, function(x) 
+      colnames(nmf_kme)[order(-x)][1:n_cutoff])
+    module_genes <- wideDF2namedList(module_genes)
+  } else {
+    module_genes <- apply(nmf_kme, 1, function(x) 
+      colnames(nmf_kme)[x > norm_cutoff])
+  }
+  
+  module_size <- unlist(lapply(module_genes, length))
+  nmf_module_genes <- module_genes[module_size > 0]
+  
+  return(nmf_module_genes)
+}
+```
+
+# ==============================================================================
+# DATA LOADING AND PREPROCESSING
+# ==============================================================================
+
+```{r load_hovestadt_2019, eval=TRUE}
+# Load and process Hovestadt 2019 GSE119926 dataset
+redo_preprocess <- FALSE
+
+if (redo_preprocess) {
+  current_dir <- "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Medulloblastoma/data/Hovestadt_2019_GSE119926/raw/"
+  
+  # Get file list and metadata
+  hove_list <- list.files(current_dir)
+  df_hove_list <- data.frame(id = hove_list)
+  df_hove_list$sample <- gsub(".txt.gz", "", stringr::str_remove(df_hove_list$id, "GSM[0-9]*_")) 
+  
+  # Load metadata
+  df_meta <- readxl::read_xlsx(
+    "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Medulloblastoma/data/Hovestadt_2019_GSE119926/TableS1.xlsx", 
+    "cohort"
+  )
+  
+  df_meta$sample <- df_meta$Sample
+  df_hove_list$is_patient <- df_hove_list$sample %in% df_meta$Sample[df_meta$Type %in% c("Diagnostic", "Recurrent")]
+  df_hove_list2 <- merge(df_hove_list, df_meta, by = "sample")
+  
+  # Create Seurat objects for each sample
+  seurat_list <- list()
+  for (i in 1:nrow(df_hove_list2)) {
+    if (!(df_hove_list2$is_patient[i])) next
+    
+    # Extract metadata
+    age <- df_hove_list2$Age[i]
+    sex <- df_hove_list2$Gender[i]
+    subtype <- df_hove_list2$subgroup2[i]
+    histology <- df_hove_list2$Histology[i]
+    metastasis <- df_hove_list2$Metastasis[i]
+    current_file <- df_hove_list2$id[i]
+    current_sample <- df_hove_list2$sample[i]
+    
+    # Load expression data
+    miko_message(current_file)
+    expr_mat <- read.delim(paste0(current_dir, current_file), header = TRUE)
+    
+    # Create Seurat object with metadata
+    seurat_list[[current_sample]] <- CreateSeuratObject(expr_mat)
+    seurat_list[[current_sample]]$sample <- current_sample
+    seurat_list[[current_sample]]$age <- age
+    seurat_list[[current_sample]]$sex <- sex
+    seurat_list[[current_sample]]$subtype <- subtype
+    seurat_list[[current_sample]]$histology <- histology
+    seurat_list[[current_sample]]$metastasis <- metastasis
+  }
+  
+  # Merge and process
+  so_hovestadt <- merge(seurat_list[[1]], y = seurat_list[-1])
+  so_hovestadt@meta.data$study <- "Hovestadt_2019"
+  so_hovestadt@meta.data$diagnosis <- "MB"
+  
+  # Standard processing pipeline
+  so_hovestadt <- filterData(so_hovestadt)
+  so_hovestadt <- NormalizeData(so_hovestadt)
+  so_hovestadt <- ScaleData(so_hovestadt)
+  so_hovestadt <- FindVariableFeatures(so_hovestadt)
+  so_hovestadt <- RunPCA(so_hovestadt, features = VariableFeatures(so_hovestadt))
+  so_hovestadt <- RunUMAP(so_hovestadt, dims = 1:50)
+  so_hovestadt <- FindNeighbors(so_hovestadt, dims = 1:50)
+  so_hovestadt <- FindClusters(so_hovestadt, resolution = 1)
+  
+  # Batch correction
+  so_hovestadt <- runScanorama(object = so_hovestadt, batch = "sample")
+  so_hovestadt <- RunUMAP(so_hovestadt, dims = 1:50)
+  so_hovestadt <- FindNeighbors(so_hovestadt, dims = 1:50)
+  so_hovestadt <- FindClusters(so_hovestadt, resolution = 1)
+  
+  saveRDS(so_hovestadt, "MB_01_Hovestadt_seurat_object_270524.rds")
+} else {
+  so_hovestadt <- readRDS("MB_01_Hovestadt_seurat_object_270524.rds")
+}
+
+# Validate MB subtype classification
+MB_subtype_markers <- list(
+  WNT = c("WIF1", "TNC", "GAD1", "DKK2", "EMX2"),
+  SHH = c("PDLIM3", "EYA1", "HHIP", "ATOH1", "SFRP1"),
+  G3 = c("IMPG2", "GABRA5", "EYS", "NRL", "MAB21L2", "NPR3"),
+  G4 = c("KCNA1", "EOMES", "KHDRBS2", "RBM24", "UNC5D", "OAS1")
+)
+
+ms_res_hove <- runMS(object = so_hovestadt, genelist = MB_subtype_markers, scale = FALSE)
+```
+
+```{r load_riemondy_2022, eval=TRUE}
+# Load and process Riemondy 2022 GSE156053 dataset
+do_reprocess <- FALSE
+
+if (do_reprocess) {
+  current_dir <- "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Medulloblastoma/data/Riemondy_2022_GSE156053/"
+  
+  # Load expression matrix and metadata
+  expr_mat <- read.delim(paste0(current_dir, "exprMatrix.tsv"), header = TRUE)
+  expr_mat <- col2rowname(expr_mat, "gene")
+  so_riemondy <- CreateSeuratObject(expr_mat)
+  
+  df_umap <- read.delim(paste0(current_dir, "umap.coords.tsv.gz"), header = FALSE) 
+  colnames(df_umap) <- c("Cell", "x", "y")
+  df_meta <- read.delim(paste0(current_dir, "meta.tsv"))
+  
+  # Helper function to map features
+  c2feature <- function(dat, feature) {
+    c2f <- as.character(dat[, feature])
+    names(c2f) <- dat$Cell
+    return(c2f)
+  }
+  
+  # Add metadata
+  so_riemondy@meta.data$sample <- gsub("X", "", colnames(so_riemondy))
+  so_riemondy@meta.data$subtype <- c2feature(df_meta, "subgroup")[so_riemondy@meta.data$sample]
+  so_riemondy@meta.data$subtype <- gsub("P", "", so_riemondy@meta.data$subtype)
+  so_riemondy@meta.data$cell_type <- c2feature(df_meta, "cell_type")[so_riemondy@meta.data$sample]
+  so_riemondy@meta.data$sample <- c2feature(df_meta, "UPN")[so_riemondy@meta.data$sample]
+  
+  # Filter for malignant cells only
+  so_riemondy <- so_riemondy[, so_riemondy@meta.data$cell_type %in% "malignant"]
+  
+  # Standard processing
+  so_riemondy <- filterData(so_riemondy)
+  so_riemondy <- NormalizeData(so_riemondy)
+  so_riemondy <- ScaleData(so_riemondy)
+  so_riemondy <- FindVariableFeatures(so_riemondy)
+  so_riemondy <- RunPCA(so_riemondy, features = VariableFeatures(so_riemondy))
+  so_riemondy <- RunUMAP(so_riemondy, dims = 1:50)
+  so_riemondy <- FindNeighbors(so_riemondy, dims = 1:50)
+  so_riemondy <- FindClusters(so_riemondy, resolution = 1)
+  
+  # Batch correction
+  so_riemondy <- runScanorama(object = so_riemondy, batch = "sample")
+  so_riemondy <- RunUMAP(so_riemondy, dims = 1:50)
+  so_riemondy <- FindNeighbors(so_riemondy, dims = 1:50)
+  so_riemondy <- FindClusters(so_riemondy, resolution = 1)
+  
+  saveRDS(so_riemondy, "MB_01_Riemondy_seurat_object_270524.rds")
+} else {
+  so_riemondy <- readRDS("MB_01_Riemondy_seurat_object_270524.rds")
+}
+
+# Validate subtype classification
+ms_res_riem <- runMS(object = so_riemondy, genelist = MB_subtype_markers, scale = FALSE)
+```
+
+# ==============================================================================
+# SUBTYPE-SPECIFIC DATA PREPARATION
+# ==============================================================================
+
+```{r prepare_subtype_data, eval=TRUE}
+# Extract and prepare G3, G4, and combined G3/G4 datasets
+do_g3_reprocess <- FALSE
+do_g4_reprocess <- FALSE
+do_g34_reprocess <- FALSE
+
+# Process G3 samples
+if (do_g3_reprocess) {
+  so_hove_g3 <- so_hovestadt[, so_hovestadt@meta.data$subtype %in% "G3"]
+  so_riem_g3 <- so_riemondy[, so_riemondy@meta.data$subtype %in% "G3"]
+  
+  hove_g3_list <- SplitObject(so_hove_g3, split.by = "sample")
+  riem_g3_list <- SplitObject(so_riem_g3, split.by = "sample")
+  
+  names(hove_g3_list) <- paste0("HOVE_", names(hove_g3_list))
+  names(riem_g3_list) <- paste0("RIEM_", names(riem_g3_list))
+  
+  g3_list <- c(hove_g3_list, riem_g3_list)
+  g3_list <- normDataList(g3_list)
+  
+  saveRDS(g3_list, "MB_01_G3MB_tumor_seurat_list_270524.rds")
+} else {
+  g3_list <- readRDS("MB_01_G3MB_tumor_seurat_list_270524.rds")
+}
+
+# Process G4 samples (similar structure)
+if (do_g4_reprocess) {
+  # Similar processing for G4...
+  saveRDS(g4_list, "MB_01_G4MB_tumor_seurat_list_050624.rds")
+} else {
+  g4_list <- readRDS("MB_01_G4MB_tumor_seurat_list_050624.rds")
+}
+
+# Process combined G3/G4 samples
+if (do_g34_reprocess) {
+  # Similar processing for G3+G4...
+  saveRDS(g34_list, "MB_01_G34MB_tumor_seurat_list_050624.rds")
+} else {
+  g34_list <- readRDS("MB_01_G34MB_tumor_seurat_list_050624.rds")
+}
+```
+
+# ==============================================================================
+# INTEGRATION AND DIMENSIONALITY REDUCTION
+# ==============================================================================
+
+```{r integration_analysis, eval=TRUE}
+# Integrate samples using Seurat's SCT integration workflow
+do_g34_integration <- FALSE
+
+if (do_g34_integration) {
+  # Merge and integrate
+  so_merge <- merge(g34_list[[1]], y = g34_list[-1])
+  
+  # Find integration features
+  object_features <- SelectIntegrationFeatures(object.list = g34_list, nfeatures = 2000)
+  object_list <- PrepSCTIntegration(object.list = g34_list, anchor.features = object_features)
+  
+  # Run PCA on each dataset
+  min_dim <- min(unlist(lapply(object_list, ncol)))
+  min_dim <- 50
+  object_list <- pbapply::pblapply(X = object_list, FUN = RunPCA, 
+                                   features = object_features, verbose = TRUE, npcs = min_dim)
+  
+  # Find integration anchors
+  object_anchors <- FindIntegrationAnchors(
+    object.list = object_list, 
+    normalization.method = "SCT", 
+    k.filter = 70,
+    anchor.features = object_features, 
+    dims = 1:30, 
+    reduction = "rpca", 
+    k.anchor = 20
+  )
+  
+  # Integrate data
+  k_weight <- 35
+  if (k_weight > min_dim) k_weight <- min_dim
+  object2 <- IntegrateData(
+    anchorset = object_anchors, 
+    normalization.method = "SCT", 
+    dims = 1:30, 
+    k.weight = k_weight
+  )
+  
+  # Dimensionality reduction and clustering
+  var_threshold <- 0.9
+  object2 <- RunPCA(object2)
+  df_object_var <- propVarPCA(object2)
+  object_n_dim <- df_object_var$pc.id[min(which(df_object_var$pc.cum_sum > var_threshold))]
+  
+  object2 <- RunUMAP(object2, reduction = "pca", dims = 1:object_n_dim, return.model = TRUE)
+  object2 <- FindNeighbors(object2, dims = 1:object_n_dim)
+  object2 <- FindClusters(object2)
+  object2 <- PrepSCTFindMarkers(object2)
+  
+  # Additional batch correction with BBKNN
+  so_g34mb <- object2
+  so_g34mb <- runBBKNN(so_g34mb, batch = "sample")
+  so_g34mb <- FindClusters(so_g34mb, graph.name = "bbknn", resolution = 0.5)
+  so_g34mb <- FindClusters(so_g34mb, graph.name = "bbknn", resolution = 1)
+  
+  saveRDS(so_g34mb, file = "MB_01_G34MB_integrated_seurat_object_050624.rds")
+} else {
+  so_g34mb <- readRDS("MB_01_G34MB_integrated_seurat_object_050624.rds")
+}
+
+DefaultAssay(so_g34mb) <- "SCT"
+```
+
+# ==============================================================================
+# MODEL SELECTION AND SETUP
+# ==============================================================================
+
+```{r model_selection}
+# Choose which model to analyze: G3, G4, or G34 (combined)
+which_model <- "G34"  # Options: "G3", "G4", "G34"
+
+if (which_model == "G3") {
+  if (!exists("so_g3mb")) so_g3mb <- readRDS("MB_01_G3MB_integrated_seurat_object_280524.rds")
+  if (!exists("g3_list")) g3_list <- readRDS("MB_01_G3MB_tumor_seurat_list_270524.rds")
+  so_query <- so_g3mb
+  so_list <- g3_list
+} else if (which_model == "G4") {
+  if (!exists("so_g4mb")) so_g4mb <- readRDS("MB_01_G4MB_integrated_seurat_object_050624.rds")  
+  if (!exists("g4_list")) g4_list <- readRDS("MB_01_G4MB_tumor_seurat_list_050624.rds")
+  so_query <- so_g4mb
+  so_list <- g4_list  
+} else if (which_model == "G34") {
+  if (!exists("so_g34mb")) so_g34mb <- readRDS("MB_01_G34MB_integrated_seurat_object_050624.rds")
+  if (!exists("g34_list")) g34_list <- readRDS("MB_01_G34MB_tumor_seurat_list_050624.rds")
+  so_query <- so_g34mb
+  so_list <- g34_list  
+}
+
+# Clean up memory
+cleanup_objects <- c("so_g3mb", "g3_list", "so_g4mb", "g4_list", "so_g34mb", "g34_list", 
+                     "object_anchors", "object_list", "so_riemondy", "so_hovestadt")
+for (obj in cleanup_objects) {
+  try(rm(list = obj, envir = .GlobalEnv), silent = TRUE)
+}
+gc()
+```
+```{r create mapping data.frame for referencing}
+
+mapping.df <- NULL
+for (i in 1:length(so_list)){
+  current.sample <- names(so_list)[i]
+  mapping.df <-  bind_rows(
+    mapping.df,
+    data.frame(
+      sample = current.sample,
+      subtype = unique(so_list[[current.sample]]@meta.data[["subtype"]])
+    )        
+  )
+}
+
+# saveRDS(mapping.df, file = "MB_01_sample_subtype_mapping.rds")
+
+```
+
+
+# ==============================================================================
+# NON-NEGATIVE MATRIX FACTORIZATION (NMF) ANALYSIS
+# ==============================================================================
+
+```{r nmf_analysis, eval=TRUE}
+# Perform NMF analysis to identify gene programs
+redo_nmf <- FALSE
+
+if (redo_nmf) {
+  library(NNLM)
+  
+  # Prepare expression matrices for each sample
+  for (i in 1:length(so_list)) {
+    # Get expressed genes (exclude mitochondrial and ribosomal)
+    expr_genes <- getExpressedGenes(so_list[[i]], min.pct = 0.005)
+    expr_genes <- expr_genes[!grepl("mt-|rps|rpl", tolower(expr_genes))]
+    
+    # Get residuals from SCTransform
+    so_list[[i]] <- GetResidual(so_list[[i]], features = expr_genes, assay = "SCT")
+    
+    # Update scale.data with filtered genes
+    emat <- so_list[[names(so_list)[i]]]@assays[["SCT"]]@scale.data
+    emat <- emat[rownames(emat) %in% expr_genes, ]
+    so_list[[names(so_list)[i]]]@assays[["SCT"]]@scale.data <- emat
+    so_list[[names(so_list)[i]]]@assays[["SCT"]]@var.features <- rownames(emat)
+  }
+  
+  # Run NMF for each sample
+  nmf_results_list <- list()
+  
+  for (j in 1:length(so_list)) {
+    current_sample <- names(so_list)[j]
+    miko_message(current_sample)
+    object <- so_list[[current_sample]]
+    
+    # Prepare expression matrix (non-negative)
+    expr_mat <- object@assays[["SCT"]]@scale.data
+    expr_mat[expr_mat < 0] <- 0
+    
+    k_ranks <- 2:15  # Range of factors to test
+    
+    # Parallel NMF computation
+    num_cores <- min(18, length(k_ranks))
+    cl <- parallel::makeCluster(num_cores)
+    doParallel::registerDoParallel(cl)
+    
+    nmf_model_list <- foreach(
+      ind = 1:length(k_ranks), 
+      .packages = c("dplyr", "NNLM", "NMF")
+    ) %dopar% {
+      z <- nnmf(expr_mat, k_ranks[ind], verbose = FALSE, check.k = FALSE)
+      return(nmfModel(H = z$H, W = z$W))
+    }
+    
+    names(nmf_model_list) <- paste0(current_sample, "_k", k_ranks)
+    
+    parallel::stopCluster(cl)
+    closeAllConnections()
+    gc()
+    
+    # Extract gene programs from NMF results
+    nmf_gene_current <- list()
+    for (i in 1:length(nmf_model_list)) {
+      nmf_name <- names(nmf_model_list)[i]
+      current_model <- nmf_model_list[[nmf_name]]
+      current_genes <- getNMFGenes.dev(
+        feature_loading = current_model@W, 
+        norm_cutoff = NA, 
+        n_cutoff = 50
+      )
+      nmf_name2 <- gsub(paste0(current_sample, "_"), "", nmf_name)
+      names(current_genes) <- paste0(nmf_name2, "_", seq(1, as.numeric(gsub("k", "", nmf_name2))))
+      nmf_gene_current[[nmf_name]] <- current_genes
+    }
+    
+    # Flatten gene lists and calculate similarity
+    nmf_gene_flat <- list()
+    for (i in 1:length(nmf_gene_current)) {
+      nmf_gene_flat <- c(nmf_gene_flat, nmf_gene_current[[i]])
+    }
+    
+    jmat_multi <- jaccardSimilarityMatrix(nmf_gene_flat)
+    
+    # Store results
+    nmf_results_list[[current_sample]] <- list(
+      sample = current_sample,
+      nmf = nmf_model_list,
+      programs = nmf_gene_current,
+      programs_flat = nmf_gene_flat,
+      jaccard_matrix = jmat_multi
+    )
+  }
+  
+  nmf_results_all <- nmf_results_list
+  saveRDS(nmf_results_all, "NMF_G34MB_v1_060624.rds")
+} else {
+  if (which_model == "G3") {
+    nmf_results_all <- readRDS("NMF_G3MB_v1_270524.rds")
+  } else if (which_model == "G4") {
+    nmf_results_all <- readRDS("NMF_G4MB_v1_060624.rds")
+  } else if (which_model == "G34") {
+    nmf_results_all <- readRDS("NMF_G34MB_v1_060624.rds") 
+  }
+}
+```
+
+
+# ==============================================================================
+# CONSENSUS GENE PROGRAM IDENTIFICATION
+# ==============================================================================
+
+```{r consensus_programs}
+# Parameters for consensus program identification
+if (which_model == "G3") {
+  top_n_genes <- 50 
+  intra_threshold <- 0.3 
+  inter_threshold <- 0.3 
+  n_clusters <- 2
+  prevalence_thresh <- 0.5
+} else if (which_model == "G4") {
+  top_n_genes <- 50 
+  intra_threshold <- 0.3 
+  inter_threshold <- 0.3 
+  n_clusters <- 2
+  prevalence_thresh <- 0.5
+} else if (which_model == "G34") {
+  top_n_genes <- 50 
+  intra_threshold <- 0.3 
+  inter_threshold <- 0.3 
+  n_clusters <- 3
+  prevalence_thresh <- 0.5
+}
+
+redo_consensus <- TRUE
+
+if (redo_consensus) {
+  nmf_results_list <- nmf_results_all
+  
+  # Re-extract gene sets with specified parameters
+  for (j in 1:length(nmf_results_list)) {
+    current_sample <- names(nmf_results_list)[j]
+    miko_message(current_sample)
+    
+    nmf_gene_current <- list()
+    nmf_model_list <- nmf_results_list[[current_sample]]$nmf
+    
+    for (i in 1:length(nmf_model_list)) {
+      nmf_name <- names(nmf_model_list)[i]
+      current_model <- nmf_model_list[[nmf_name]]
+      current_genes <- getNMFGenes.dev(
+        feature_loading = current_model@W, 
+        norm_cutoff = NA, 
+        n_cutoff = top_n_genes
+      )
+      nmf_name2 <- gsub(paste0(current_sample, "_"), "", nmf_name)
+      names(current_genes) <- paste0(nmf_name2, "_", seq(1, as.numeric(gsub("k", "", nmf_name2))))
+      nmf_gene_current[[nmf_name]] <- current_genes
+    }
+    
+    nmf_gene_flat <- list()
+    for (i in 1:length(nmf_gene_current)) {
+      nmf_gene_flat <- c(nmf_gene_flat, nmf_gene_current[[i]])
+    }
+    
+    nmf_results_list[[current_sample]]$programs <- nmf_gene_current
+    nmf_results_list[[current_sample]]$programs_flat <- nmf_gene_flat
+  }
+  
+  # Identify robust intra-sample programs
+  nmf_gene_all <- list()
+  for (i in 1:length(nmf_results_list)) {
+    current_sample <- names(nmf_results_list)[i]
+    nmf_gene_flat <- nmf_results_list[[current_sample]]$programs_flat
+    
+    jmat_multi <- jaccardSimilarityMatrix(nmf_gene_flat)
+    jmat_multi_intra <- jmat_multi[
+      apply(jmat_multi, 1, function(x) sum(x > intra_threshold) > 1), 
+    ]
+    
+    if (nrow(jmat_multi_intra) == 0) next
+    
+    nmf_gene_robust <- nmf_gene_flat[rownames(jmat_multi_intra)]
+    names(nmf_gene_robust) <- paste0(current_sample, "_", names(nmf_gene_robust))
+    nmf_gene_all <- c(nmf_gene_all, nmf_gene_robust)
+  }
+  
+  # Identify inter-sample robust programs
+  jmat_all <- jaccardSimilarityMatrix(nmf_gene_all)
+  all_samples <- unique(stringr::str_remove(names(nmf_gene_all), "_k[0-9]*_[0-9]*"))
+  
+  robust_inter <- apply(jmat_all, 1, function(x) {
+    rownames(jmat_all)[which(x > inter_threshold)]
+  })
+  
+  robust_inter <- lapply(robust_inter, function(x) {
+    ulength(stringr::str_remove(x, "_k[0-9]*_[0-9]*"))
+  })
+  robust_programs <- names(robust_inter)[unlist(robust_inter) > 1]
+  
+  # Cluster robust programs
+  jmat_robust <- jmat_all[robust_programs, robust_programs]
+  dmat_robust <- as.dist(DiffCorr::cor.dist(jmat_robust, methods = "pearson", absolute = FALSE))
+  hmat_robust <- cutree(hclust(dmat_robust), k = n_clusters)
+  
+  # Create annotation dataframe
+  df_program_ann <- data.frame(
+    program = rownames(jmat_robust),
+    cluster = paste0("nmf_", hmat_robust)
+  )
+  df_program_ann <- col2rowname(df_program_ann, "program")
+  
+  # Generate final consensus programs
+  uclust <- unique(hmat_robust)
+  nmf_robust_list <- nmf_robust_final <- list()
+  
+  for (i in 1:length(uclust)) {
+    program_name <- paste0("G", i)
+    nmf_robust_list[[program_name]] <- nmf_gene_all[
+      rownames(jmat_robust)[hmat_robust == uclust[i]]
+    ]
+    n_programs <- length(nmf_robust_list[[program_name]])
+    df_tally <- data.frame(table(unlist(nmf_robust_list[[program_name]])))
+    df_tally$prop <- df_tally$Freq / n_programs
+    nmf_robust_final[[program_name]] <- as.character(
+      df_tally$Var1[df_tally$prop > prevalence_thresh]
+    )
+  }
+  
+  # Create heatmap visualization
+  plt_hm <- miko_heatmap(
+    jmat_robust, 
+    cutree_col = n_clusters, 
+    cutree_row = n_clusters, 
+    show_colnames = FALSE,
+    clustering_distance_rows = "correlation",
+    clustering_distance_cols = "correlation",
+    border_color = NA, 
+    annotation_row = df_program_ann, 
+    annotation_col = df_program_ann
+  )
+}
+
+plt_hm
+```
+
+# ==============================================================================
+# GENE PROGRAM SCORING AND VISUALIZATION
+# ==============================================================================
+
+```{r program_scoring, fig.width=14, fig.height=4}
+# Score NMF programs on integrated UMAP
+DefaultAssay(so_query) <- "SCT"
+
+ms_nmf_results <- runMS(
+  object = so_query, 
+  genelist = nmf_robust_final, 
+  reduction = "b"
+)
+
+# Create activity plots
+plotActivity <- function(data, score) {
+  data$z <- data[, score]
+  data %>%
+    ggplot(aes(x = x, y = y, color = z)) +
+    scattermore::geom_scattermore(pointsize = 1) + 
+    viridis::scale_color_viridis(option = "A", direction = -1) + 
+    theme_miko(legend = TRUE)
+}
+
+# Generate program activity plots
+program_plots <- list()
+for (i in 1:length(nmf_robust_final)) {
+  program_name <- names(nmf_robust_final)[i]
+  program_plots[[program_name]] <- plotActivity(ms_nmf_results$data, program_name) + labs(title = program_name)
+}
+
+plt_combo <- cowplot::plot_grid(plotlist = program_plots, nrow = 1)
+plt_combo
+```
+
+# ==============================================================================
+# FUNCTIONAL ANNOTATION AND ENRICHMENT ANALYSIS
+# ==============================================================================
+
+```{r functional_annotation, fig.width=16, fig.height=4}
+# Prepare gene universe for enrichment analysis
+df_gene_universe <- data.frame(table(unlist(lapply(so_list, rownames))))
+colnames(df_gene_universe) <- c("gene", "n")
+gene_universe <- df_gene_universe$gene[df_gene_universe$n > 3]
+
+# Run hypergeometric enrichment tests
+enrichment_databases <- c("Bader", "msigdb", "Reactome", "GO", "KEGG")
+enrichment_results <- list()
+
+for (db in enrichment_databases) {
+  enrichment_results[[db]] <- runHG(
+    nmf_robust_final, 
+    gene.universe = gene_universe, 
+    species = "Hs", 
+    pathway.db = db
+  )
+}
+
+# Summarize enrichment results
+enrichment_summaries <- lapply(enrichment_results, function(x) {
+  summarizeHG(x, show.n = 10)
+})
+
+# Create enrichment plots
+enrichment_plots <- lapply(enrichment_summaries, function(x) {
+  cowplot::plot_grid(plotlist = x$plots, nrow = 1)
+})
+enrichment_plots
+```
+
+# ==============================================================================
+# CORRELATION ANALYSIS WITH GENE PROGRAMS
+# ==============================================================================
+
+```{r correlation_analysis}
+# Analyze correlations between gene programs and individual genes
+correlation_results_list <- list()
+
+for (i in 1:length(so_list)) {
+  sample_name <- names(so_list)[i]
+  miko_message(i)
+  object <- so_list[[sample_name]]
+  
+  try({
+
+  # Calculate program scores
+  ms_results <- runMS(object = object, genelist = nmf_robust_final, return.plots = FALSE)
+  object@meta.data$state <- ms_results$data$class.ms
+  object@meta.data$G1 <- ms_results$data$G1
+  object@meta.data$G2 <- ms_results$data$G2
+  
+  if (which_model == "G34") {
+    object@meta.data$G3 <- ms_results$data$G3
+    correlation_features <- c("G1", "G2", "G3")
+  } else {
+    correlation_features <- c("G1", "G2")
+  }
+  
+  # Find correlated markers
+  cor_results <- findCorMarkers(
+    object = object, 
+    features.x = correlation_features, 
+    geosketch.subset = TRUE
+  )
+  
+  cor_results$sample <- sample_name
+  correlation_results_list[[sample_name]] <- cor_results
+      
+  })
+}
+
+# Summarize correlation results across samples
+df_correlation_all <- bind_rows(correlation_results_list)
+df_correlation_summary <- df_correlation_all %>% 
+  dplyr::group_by(feature.x, feature.y) %>%
+  dplyr::summarise(
+    rho_mean = mean(rho, na.rm = TRUE),
+    rho_sd = sd(rho, na.rm = TRUE),
+    rho_pval = tryCatch({
+      wilcox.test(rho)$p.value
+    }, error = function(e) { 
+      return(1) 
+    }),
+    .groups = 'drop'
+  ) %>%
+  pivot_wider(
+    names_from = feature.x, 
+    values_from = c("rho_mean", "rho_sd", "rho_pval")
+  )
+
+# Process correlation summary
+if (which_model == "G34") {
+  colnames(df_correlation_summary) <- c(
+    "feature", "G1_rho", "G2_rho", "G3_rho",
+    "G1_sd", "G2_sd", "G3_sd",
+    "G1_p", "G2_p", "G3_p"
+  )
+} else {
+  colnames(df_correlation_summary) <- c(
+    "feature", "G1_rho", "G2_rho", 
+    "G1_sd", "G2_sd", 
+    "G1_p", "G2_p"
+  )
+}
+
+df_correlation_summary <- df_correlation_summary[complete.cases(df_correlation_summary), ]
+
+# Calculate z-scores and identify significant correlations
+correlation_threshold <- 0.2
+correlation_significant_list <- list(
+  G1 = df_correlation_summary$feature[
+    p.adjust(df_correlation_summary$G1_p, method = "BH") < 0.05 & 
+    df_correlation_summary$G1_rho > correlation_threshold
+  ],
+  G2 = df_correlation_summary$feature[
+    p.adjust(df_correlation_summary$G2_p, method = "BH") < 0.05 & 
+    df_correlation_summary$G2_rho > correlation_threshold
+  ]
+)
+
+if (which_model == "G34") {
+  correlation_significant_list$G3 <- df_correlation_summary$feature[
+    p.adjust(df_correlation_summary$G3_p, method = "BH") < 0.05 & 
+    df_correlation_summary$G3_rho > correlation_threshold
+  ]
+}
+
+# Filter for genes present in multiple samples
+correlation_significant_list <- lapply(correlation_significant_list, function(x) {
+  x[x %in% df_gene_universe$gene[df_gene_universe$n > 8]]
+})
+```
+
+# ==============================================================================
+# PATHWAY CORRELATION ANALYSIS
+# ==============================================================================
+
+```{r pathway_correlations}
+# Load pathway gene sets
+data(geneSets)
+MB_subtype_markers <- list(
+  MB_WNT = c("WIF1", "TNC", "GAD1", "DKK2", "EMX2"),
+  MB_SHH = c("PDLIM3", "EYA1", "HHIP", "ATOH1", "SFRP1"),
+  MB_G3 = c("IMPG2", "GABRA5", "EYS", "NRL", "MAB21L2", "NPR3"),
+  MB_G4 = c("KCNA1", "EOMES", "KHDRBS2", "RBM24", "UNC5D", "OAS1")
+)
+
+# Convert symbols to entrez IDs
+df_symbol_to_entrez <- sym2entrez(rownames(so_query), my.species = "Hs")
+df_symbol_to_entrez <- df_symbol_to_entrez[complete.cases(df_symbol_to_entrez), ]
+
+# Create mapping
+entrez_to_symbol <- df_symbol_to_entrez$SYMBOL
+names(entrez_to_symbol) <- as.character(df_symbol_to_entrez$ENTREZID)
+
+# Get pathway gene sets
+gavish_genesets <- wideDF2namedList(geneSets[["Gavish2022_Tumor_Hallmarks"]]) 
+cancersea_genesets <- wideDF2namedList(geneSets[["CancerSEA_Hs"]]) 
+
+hallmark_genesets <- getAnnotationPathways(
+  query.genes = df_symbol_to_entrez$ENTREZID, 
+  db = 'msigdb'
+)
+hallmark_genesets <- lapply(hallmark_genesets, function(x) {
+  x <- entrez_to_symbol[as.character(x)]
+  x <- x[!is.na(x)]
+  return(x)
+})
+
+kegg_genesets <- getAnnotationPathways(
+  query.genes = df_symbol_to_entrez$ENTREZID, 
+  db = 'KEGG'
+)
+kegg_genesets <- lapply(kegg_genesets, function(x) {
+  x <- entrez_to_symbol[as.character(x)]
+  x <- x[!is.na(x)]
+  return(x)
+})
+
+# Combine all gene sets
+master_geneset_list <- c(
+  MB_subtype_markers, 
+  hallmark_genesets, 
+  gavish_genesets, 
+  cancersea_genesets, 
+  kegg_genesets
+)
+
+# Score pathways on integrated object
+ms_master_results <- runMS(
+  object = so_query, 
+  genelist = master_geneset_list, 
+  reduction = "b", 
+  raster = TRUE, 
+  return.plots = FALSE
+)
+
+# Calculate pathway-program correlations
+df_pathway_scores <- ms_master_results$data[, names(master_geneset_list)]
+df_program_scores <- ms_nmf_results$data[, names(nmf_robust_final)]
+
+df_pathway_correlations <- data.frame(cor(df_pathway_scores, df_program_scores))
+df_pathway_correlations$pathway <- rownames(df_pathway_correlations)
+
+# Create correlation visualization
+correlation_threshold_plot <- 0.5
+df_correlation_labels <- df_pathway_correlations %>% 
+  dplyr::filter(abs(G1) > correlation_threshold_plot | abs(G2) > correlation_threshold_plot)
+
+plt_pathway_correlations <- df_pathway_correlations %>%
+  ggplot(aes(x = G1, y = G2)) +
+  annotate(
+    geom = "rect", 
+    ymin = -correlation_threshold_plot, 
+    ymax = correlation_threshold_plot, 
+    xmax = correlation_threshold_plot, 
+    xmin = -correlation_threshold_plot, 
+    alpha = 0.2
+  ) + 
+  geom_point(color = "grey60") +
+  ggrepel::geom_text_repel(
+    data = df_correlation_labels,
+    aes(label = pathway), 
+    max.overlaps = Inf, 
+    min.segment.length = 0, 
+    size = 2
+  ) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  geom_vline(xintercept = 0, linetype = "dashed") + 
+  theme_miko() + 
+  labs(
+    x = "G1 Pathway Correlation (r)", 
+    y = "G2 Pathway Correlation (r)", 
+    title = "Pathway Correlates"
+  )
+
+plt_pathway_correlations
+```
+
+# ==============================================================================
+# STEMNESS AND METABOLISM ANALYSIS
+# ==============================================================================
+
+```{r stemness_metabolism,  fig.width = 16, fig.height = 4}
+# Analyze stemness and metabolic signatures
+df_all_scores <- NULL
+
+for (i in 1:length(so_list)) {
+  sample_name <- names(so_list)[i]
+  miko_message(i)
+  object <- so_list[[sample_name]]
+    try({
+  # Calculate stemness scores
+  stem_ccat_scores <- scoreStem(
+    object = object,
+    method = "CCAT",
+    min.pct = 0.01,
+    assay = DefaultAssay(object),
+    batch = NULL,
+    verbose = TRUE
+  )
+  
+  # Score metabolism pathways
+  metabolism_genesets <- list(
+    pyrimidine_metabolism = master_geneset_list$KEGG_PYRIMIDINE_METABOLISM,
+    purine_metabolism = master_geneset_list$KEGG_PURINE_METABOLISM
+  )
+  
+  ms_metabolism <- runMS(
+    object = object, 
+    genelist = metabolism_genesets, 
+    return.plots = FALSE
+  )
+  
+  # Get program scores
+  ms_programs <- runMS(object = object, genelist = nmf_robust_final, return.plots = FALSE)
+  
+  # Combine scores
+  df_current_scores <- ms_programs$data
+  df_current_scores$PURINE <- ms_metabolism$data$purine_metabolism
+  df_current_scores$PYRIMIDINE <- ms_metabolism$data$pyrimidine_metabolism
+  df_current_scores$ccat <- stem_ccat_scores
+  df_current_scores$sample <- sample_name
+  
+  # Add MYC expression if available
+
+    df_current_scores$myc <- as.numeric(object@assays[["SCT"]]["MYC", ])
+  })
+  
+  df_all_scores <- bind_rows(df_all_scores, df_current_scores)
+}
+
+# Analyze correlations with stemness and metabolism
+correlation_method <- "spearman"
+
+# Stemness correlations
+df_stemness_correlations <- df_all_scores %>%
+  dplyr::group_by(sample) %>%
+  dplyr::summarize(
+    G1_cor = cor(G1, ccat, method = correlation_method),
+    G2_cor = cor(G2, ccat, method = correlation_method),
+    G3_cor = if("G3" %in% names(.)) cor(G3, ccat, method = correlation_method) else NA,
+    .groups = 'drop'
+  )
+
+# MYC correlations
+df_myc_correlations <- df_all_scores %>%
+  dplyr::group_by(sample) %>%
+  dplyr::summarize(
+    G1_cor = cor(G1, myc, method = correlation_method),
+    G2_cor = cor(G2, myc, method = correlation_method),
+    G3_cor = if("G3" %in% names(.)) cor(G3, myc, method = correlation_method) else NA,
+    .groups = 'drop'
+  )
+
+# Purine correlations
+df_purine_correlations <- df_all_scores %>%
+  dplyr::group_by(sample) %>%
+  dplyr::summarize(
+    G1_cor = cor(G1, PURINE, method = correlation_method),
+    G2_cor = cor(G2, PURINE, method = correlation_method),
+    G3_cor = if("G3" %in% names(.)) cor(G3, PURINE, method = correlation_method) else NA,
+    .groups = 'drop'
+  )
+
+# Pyrimidine correlations
+df_pyrimidine_correlations <- df_all_scores %>%
+  dplyr::group_by(sample) %>%
+  dplyr::summarize(
+    G1_cor = cor(G1, PYRIMIDINE, method = correlation_method),
+    G2_cor = cor(G2, PYRIMIDINE, method = correlation_method),
+    G3_cor = if("G3" %in% names(.)) cor(G3, PYRIMIDINE, method = correlation_method) else NA,
+    .groups = 'drop'
+  )
+
+# generate summary plots
+df_stemness_correlations_long <- pivot_longer(data = df_stemness_correlations, cols =colnames(df_stemness_correlations)[-1])
+plt_stem_cor <- df_stemness_correlations_long %>%
+  ggplot(aes(x = name, y = value, fill = name)) + 
+  geom_boxplot() +
+  ggbeeswarm::geom_quasirandom() + theme_miko(legend = F, fill.palette = "ptol") + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  labs(title = "CCAT correlation", y = "Correlation")
+
+df_myc_correlations_long <- pivot_longer(data = df_myc_correlations, cols =colnames(df_myc_correlations)[-1])
+plt_myc_cor <- df_myc_correlations_long %>%
+  ggplot(aes(x = name, y = value, fill = name)) + 
+  geom_boxplot() +
+  ggbeeswarm::geom_quasirandom() + theme_miko(legend = F, fill.palette = "ptol") + 
+  geom_hline(yintercept = 0, linetype = "dashed")+ 
+  labs(title = "MYC correlation", y = "Correlation")
+
+df_purine_correlations_long <- pivot_longer(data = df_purine_correlations, cols =colnames(df_purine_correlations)[-1])
+plt_purine_cor <- df_purine_correlations_long %>%
+  ggplot(aes(x = name, y = value, fill = name)) + 
+  geom_boxplot() +
+  ggbeeswarm::geom_quasirandom() + theme_miko(legend = F, fill.palette = "ptol") + 
+  geom_hline(yintercept = 0, linetype = "dashed")+ 
+  labs(title = "Purine correlation", y = "Correlation")
+
+df_pyrimidine_correlations_long <- pivot_longer(data = df_pyrimidine_correlations, cols =colnames(df_pyrimidine_correlations)[-1])
+plt_pyrimidine_cor <- df_pyrimidine_correlations_long %>%
+  ggplot(aes(x = name, y = value, fill = name)) + 
+  geom_boxplot() +
+  ggbeeswarm::geom_quasirandom() + theme_miko(legend = F, fill.palette = "ptol") + 
+  geom_hline(yintercept = 0, linetype = "dashed")+ 
+  labs(title = "Pyrimidine correlation", y = "Correlation")
+
+
+plt_cor_combo <- cowplot::plot_grid(plt_stem_cor, plt_myc_cor,plt_purine_cor, plt_pyrimidine_cor, nrow = 1)
+plt_cor_combo
+# savePDF("MB_01_NMF_program_correlates_020625.pdf", plt_cor_combo, fig.width = 16, fig.height = 4)
+
+```
+
+
+# ==============================================================================
+# SUMMARY AND OUTPUT GENERATION
+# ==============================================================================
+
+```{r summary_output}
+# Generate summary statistics and outputs
+cat("Analysis Summary:\n")
+cat("================\n")
+cat("Model analyzed:", which_model, "\n")
+cat("Number of samples:", length(so_list), "\n")
+cat("Number of cells:", ncol(so_query), "\n")
+cat("Number of gene programs identified:", length(nmf_robust_final), "\n")
+cat("Program sizes:\n")
+for (i in 1:length(nmf_robust_final)) {
+  cat("  ", names(nmf_robust_final)[i], ":", length(nmf_robust_final[[i]]), "genes\n")
+}
+
+# Save key results
+output_files <- list(
+  nmf_programs = nmf_robust_final,
+  correlation_summary = df_correlation_summary,
+  pathway_correlations = df_pathway_correlations,
+  stemness_scores = df_all_scores,
+  drug_results = drug_results_filtered
+)
+
+# Write results to files
+for (result_name in names(output_files)) {
+  filename <- paste0("MB_01_", which_model, "_", result_name, "_", 
+                     format(Sys.Date(), "%d%m%y"), ".rds")
+  saveRDS(output_files[[result_name]], filename)
+  cat("Saved:", filename, "\n")
+}
+
+# Create final visualization summary
+summary_plots <- list(
+  plt_hm,  # Consensus clustering heatmap
+  plt_combo,  # Program activity UMAP
+  enrichment_plots$Bader,  # Functional enrichment
+  plt_pathway_correlations  # Pathway correlations
+)
+
+cat("\nAnalysis completed successfully!\n")
+cat("Key outputs generated:\n")
+cat("- Gene program definitions\n")
+cat("- Functional annotations\n") 
+cat("- Correlation analyses\n")
+```
+
+# ==============================================================================
+# SESSION INFO
+# ==============================================================================
+
+```{r session_info}
+# Record session information for reproducibility
+sessionInfo()
+```

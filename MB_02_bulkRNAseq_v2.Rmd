@@ -1,0 +1,694 @@
+---
+title: "Medulloblastoma Bulk RNA-seq Drug Treatment Analysis"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+---
+
+# Medulloblastoma Bulk RNA-seq Analysis: Omo Drug Treatment
+# This script analyzes bulk RNA-seq data from medulloblastoma samples treated with Omo
+# Includes time-course analysis (24h, 72h) and validation of scRNA-seq derived gene programs
+# Author: N. Mikolajewicz
+
+# ==============================================================================
+# SETUP AND DEPENDENCIES
+# ==============================================================================
+
+```{r setup, include=FALSE}
+# Clear environment and start timer
+rm(list = setdiff(ls(), c("data.path", "user")))
+invisible({gc()})
+start.time <- proc.time()
+
+# Load required packages
+packages_to_load <- c(
+  "Seurat", "sctransform", "Libra",
+  "dplyr", "tidyr", "RColorBrewer", "ggplot2", "gridExtra", 
+  "DT", "flexdashboard", "future", "biomaRt", "foreach", 
+  "parallel", "doParallel", "scMiko", "reshape2", "glmGamPoi",
+  "DESeq2", "readxl"
+)
+invisible({lapply(packages_to_load, library, character.only = TRUE)})
+```
+
+```{r config}
+# Set working directory and paths
+base_dir <- "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Collaborations/Laura/"
+
+# Analysis parameters
+analysis_timepoint <- "72h"  # Options: "all", "24h", "72h"
+significance_threshold <- 0.05
+```
+
+# ==============================================================================
+# DATA IMPORT AND PREPROCESSING
+# ==============================================================================
+
+```{r data_import}
+# Load bulk RNA-seq count data
+cat("Loading bulk RNA-seq data...\n")
+count_data <- read.table(
+  paste0(base_dir, "salmon.merged.gene_counts_length_scaled SUMB002_LE.tsv"), 
+  header = TRUE
+)
+
+# Clean and format count data
+count_data <- count_data %>% 
+  dplyr::select(-gene_id) %>%
+  col2rowname("gene_name")
+
+# Load sample metadata
+metadata <- readxl::read_xlsx(
+  paste0(base_dir, "LEscudero_20240707_sampleID_RNAseq_Omo_SUMB002.xlsx")
+)
+metadata <- col2rowname(metadata, "Sample ID")
+
+# Create Seurat object for compatibility with downstream analysis
+seurat_obj <- CreateSeuratObject(count_data, meta.data = metadata)
+
+cat("Data loaded successfully!\n")
+cat("Samples:", ncol(count_data), "\n")
+cat("Genes:", nrow(count_data), "\n")
+cat("Timepoints:", unique(metadata$time), "\n")
+cat("Treatments:", unique(metadata$treatment), "\n")
+```
+
+# ==============================================================================
+# DIFFERENTIAL EXPRESSION ANALYSIS WITH DESEQ2
+# ==============================================================================
+
+```{r deseq2_analysis}
+# Setup DESeq2 analysis based on selected timepoint
+cat("Setting up DESeq2 analysis for timepoint:", analysis_timepoint, "\n")
+
+if (analysis_timepoint == "all") {
+  # Analyze all timepoints together
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(count_data), 
+    colData = metadata,
+    design = ~ treatment,
+    tidy = FALSE
+  )
+} else if (analysis_timepoint == "24h") {
+  # Analyze 24h timepoint only
+  samples_24h <- rownames(metadata)[grepl("24", metadata$time)]
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(count_data[, samples_24h]), 
+    colData = metadata %>% dplyr::filter(time == "24h"),
+    design = ~ treatment,
+    tidy = FALSE
+  )
+} else if (analysis_timepoint == "72h") {
+  # Analyze 72h timepoint only
+  samples_72h <- rownames(metadata)[grepl("72", metadata$time)]
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(count_data[, samples_72h]), 
+    colData = metadata %>% dplyr::filter(time == "72h"),
+    design = ~ treatment,
+    tidy = FALSE
+  )
+}
+
+# Run DESeq2 differential expression analysis
+cat("Running DESeq2...\n")
+dds <- DESeq(dds)
+
+# Extract results
+deg_results <- results(dds)
+cat("DESeq2 analysis completed.\n")
+summary(deg_results)
+
+# Variance stabilizing transformation for visualization
+vst_data <- vst(dds, blind = FALSE)
+vst_matrix <- vst_data@assays@data@listData[[1]]
+
+# Create MA plot
+plotMA(dds)
+```
+
+# ==============================================================================
+# GENE EXPRESSION VISUALIZATION FUNCTIONS
+# ==============================================================================
+
+```{r visualization_functions}
+# Function to plot individual gene expression across conditions and timepoints
+plotGeneExpression <- function(gene_name, vst_matrix, metadata) {
+  # Validate gene exists
+  if (!gene_name %in% rownames(vst_matrix)) {
+    warning(paste("Gene", gene_name, "not found in data"))
+    return(NULL)
+  }
+  
+  # Prepare data for plotting
+  plot_data <- metadata 
+  plot_data$expression <- vst_matrix[gene_name, ]
+  plot_data$treatment <- factor(plot_data$treatment, levels = c("veh", "OMO"))
+  
+  # Create plot
+  plot_data %>%
+    ggplot(aes(x = treatment, y = expression)) + 
+    geom_boxplot(aes(fill = treatment), alpha = 0.7) + 
+    geom_point(size = 2) + 
+    facet_wrap(~time) +
+    labs(
+      x = "Treatment", 
+      y = paste(gene_name, "Expression (VST)"),
+      title = paste("Expression of", gene_name, "across conditions")
+    ) + 
+    theme_miko() +
+    scale_fill_manual(values = c("veh" = "lightgray", "OMO" = "lightblue"))
+}
+
+# Function to create volcano plot
+createVolcanoPlot <- function(deg_results, significance_threshold = 0.05, 
+                              fc_threshold = 1, title = "Volcano Plot") {
+  # Prepare data
+  volcano_data <- data.frame(
+    gene = rownames(deg_results),
+    log2FC = deg_results$log2FoldChange,
+    padj = deg_results$padj,
+    pvalue = deg_results$pvalue
+  ) %>%
+    filter(complete.cases(.)) %>%
+    mutate(
+      significant = padj < significance_threshold & abs(log2FC) > fc_threshold,
+      direction = case_when(
+        log2FC > fc_threshold & padj < significance_threshold ~ "Up",
+        log2FC < -fc_threshold & padj < significance_threshold ~ "Down",
+        TRUE ~ "NS"
+      )
+    )
+  
+  # Create plot
+  volcano_data %>%
+    ggplot(aes(x = log2FC, y = -log10(padj))) +
+    geom_point(aes(color = direction), alpha = 0.6) +
+    scale_color_manual(values = c("Up" = "red", "Down" = "blue", "NS" = "gray")) +
+    geom_vline(xintercept = c(-fc_threshold, fc_threshold), linetype = "dashed") +
+    geom_hline(yintercept = -log10(significance_threshold), linetype = "dashed") +
+    labs(
+      x = "Log2 Fold Change",
+      y = "-Log10 Adjusted P-value",
+      title = title,
+      color = "Regulation"
+    ) +
+    theme_miko()
+}
+```
+
+# ==============================================================================
+# KEY GENE EXPRESSION ANALYSIS
+# ==============================================================================
+
+```{r key_genes_analysis}
+# Define key genes of interest for medulloblastoma
+stemness_genes <- c("SOX2", "PROM1", "BMI1", "OTX2", "NANOG", "FOXG1", "MYC")
+photoreceptor_genes <- c("NRL", "CRX", "NEUROG1", "PRDM1", "GNGT1", "DCT")
+neuronal_genes <- c("NEFM", "NEUROD2", "MAP2", "SYN1", "SYP")
+mb_subtype_genes <- list(
+  G3_signature = c("MYC", "SMARCA4", "CTDNEP1"),
+  intermediate_G3_G4 = c("DDX31", "GFI1B", "OTX2", "MYCN"),
+  G4_signature = c("KDM6A", "SNCAIP", "PRDM6", "TBR1")
+)
+
+# Additional genes of interest
+other_genes <- c("TLR4", "5_8S_rRNA")
+
+# Combine all genes for analysis
+all_genes_of_interest <- unique(c(
+  stemness_genes, photoreceptor_genes, neuronal_genes, 
+  unlist(mb_subtype_genes), other_genes
+))
+
+# Generate expression plots for key genes
+cat("Generating expression plots for key genes...\n")
+stemness_plots <- list()
+for (gene in stemness_genes) {
+  if (gene %in% rownames(vst_matrix)) {
+    stemness_plots[[gene]] <- plotGeneExpression(gene, vst_matrix, metadata)
+  }
+}
+
+# Create PCA plot
+pca_plot <- DESeq2::plotPCA(vst_data, intgroup = "treatment") +
+  theme_miko(legend = T) +
+  labs(title = "PCA of Samples by Timepoint")
+
+# Display some key plots
+stemness_plots$SOX2
+stemness_plots$MYC
+pca_plot
+```
+
+# ==============================================================================
+# DIFFERENTIAL EXPRESSION RESULTS PROCESSING
+# ==============================================================================
+
+```{r deg_processing}
+# Process DESeq2 results into a comprehensive dataframe
+deg_dataframe <- bind_cols(deg_results@listData) 
+deg_dataframe$gene <- deg_results@rownames
+deg_dataframe <- deg_dataframe[complete.cases(deg_dataframe), ]
+
+# Calculate additional statistics
+deg_dataframe <- deg_dataframe %>%
+  mutate(
+    z_score = stat * -1,  # Convert to standard z-score
+    rank = rank(z_score, ties.method = "random"),
+    abs_log2FC = abs(log2FoldChange),
+    significant = padj < significance_threshold,
+    highly_significant = padj < 0.01,
+    direction = case_when(
+      log2FoldChange > 0 & significant ~ "Down-regulated",
+      log2FoldChange < 0 & significant ~ "Up-regulated",
+      TRUE ~ "Not significant"
+    )
+  )
+
+# Identify top differentially expressed genes
+deg_significant <- deg_dataframe %>% 
+  filter(significant) %>%
+  arrange(padj)
+
+deg_top_up <- deg_dataframe %>% 
+  top_n(10, z_score) %>% 
+  mutate(regulation = "Up-regulated")
+
+deg_top_down <- deg_dataframe %>% 
+  top_n(10, -z_score) %>% 
+  mutate(regulation = "Down-regulated")
+
+deg_top_genes <- bind_rows(deg_top_up, deg_top_down)
+
+cat("Differential expression summary:\n")
+cat("Total genes analyzed:", nrow(deg_dataframe), "\n")
+cat("Significantly differentially expressed:", nrow(deg_significant), "\n")
+cat("Up-regulated:", sum(deg_dataframe$direction == "Up-regulated"), "\n")
+cat("Down-regulated:", sum(deg_dataframe$direction == "Down-regulated"), "\n")
+```
+
+# ==============================================================================
+# RANK PLOT VISUALIZATION
+# ==============================================================================
+
+```{r rank_plot, fig.width=5, fig.height=8}
+# Create comprehensive rank plot showing gene expression changes
+rank_plot <- deg_dataframe %>%
+  ggplot(aes(x = rank, y = z_score)) +
+  scattermore::geom_scattermore(color = "gray60", alpha = 0.6) + 
+  geom_point(
+    data = deg_significant, 
+    aes(x = rank, y = z_score, size = abs(z_score), color = direction),
+    alpha = 0.8
+  ) + 
+  ggrepel::geom_text_repel(
+    data = deg_top_genes, 
+    aes(x = rank, y = z_score, label = gene), 
+    max.overlaps = Inf,
+    size = 3,
+    box.padding = 0.5
+  ) + 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c(
+    "Up-regulated" = "tomato", 
+    "Down-regulated" = "skyblue",
+    "Not significant" = "gray60"
+  )) +
+  scale_size_continuous(range = c(1, 4)) +
+  labs(
+    x = "Gene Rank",
+    y = "Z-score (Omo vs Vehicle)",
+    title = "Differential Gene Expression Ranking",
+    subtitle = paste("Timepoint:", analysis_timepoint),
+    color = "Regulation",
+    size = "|Z-score|"
+  ) +
+  theme_miko(legend = TRUE) +
+  guides(
+    color = guide_legend(override.aes = list(size = 3)),
+    size = guide_legend(title = "|Z-score|")
+  )
+
+rank_plot
+```
+
+# ==============================================================================
+# TIME-COURSE ANALYSIS
+# ==============================================================================
+
+```{r time_course_analysis, fig.width=12, fig.height=8}
+# Load previously computed time-course data if available
+deg_24h_file <- "MB02_deg_24h_160325.csv"
+deg_72h_file <- "MB02_deg_72h_160325.csv"
+
+if (file.exists(deg_24h_file) && file.exists(deg_72h_file)) {
+  cat("Loading time-course comparison data...\n")
+  
+  # Load time-specific results
+  deg_24h <- read.csv(deg_24h_file)
+  colnames(deg_24h) <- paste0(colnames(deg_24h), "_24h")
+  deg_24h$gene <- deg_24h$gene_24h
+  
+  deg_72h <- read.csv(deg_72h_file)
+  colnames(deg_72h) <- paste0(colnames(deg_72h), "_72h")
+  deg_72h$gene <- deg_72h$gene_72h
+  
+  # Merge time-course data
+  deg_timecourse <- merge(deg_24h, deg_72h, by = "gene") %>%
+    mutate(
+      log2FoldChange_0h = 0,
+      z_0h = 0
+    )
+  
+  # Create long-format data for visualization
+  deg_long_z <- deg_timecourse %>%
+    dplyr::select(gene, z_0h, z_24h, z_72h) %>%
+    pivot_longer(
+      cols = c("z_0h", "z_24h", "z_72h"),
+      names_to = "timepoint",
+      values_to = "z_score"
+    ) %>%
+    dplyr::mutate(
+      timepoint = recode(timepoint,
+        "z_0h" = "0h",
+        "z_24h" = "24h", 
+        "z_72h" = "72h"
+      ),
+      timepoint = factor(timepoint, levels = c("0h", "24h", "72h"))
+    )
+  
+  # Time-course trajectory plot
+  trajectory_plot <- deg_long_z %>%
+    ggplot(aes(x = timepoint, y = z_score)) + 
+    scattermore::geom_scattermore(alpha = 0.3) + 
+    geom_line(aes(group = gene), alpha = 0.05, color = "gray") +
+    geom_smooth(method = "loess", color = "red", size = 2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") + 
+    labs(
+      x = "Timepoint", 
+      y = "Z-score (Omo vs Vehicle)",
+      title = "Gene Expression Changes Over Time",
+      subtitle = "Individual gene trajectories and trend"
+    ) +
+    theme_miko()
+  
+  # 72h-specific analysis with enhanced visualization
+  deg_72h_significant <- deg_72h %>% 
+    filter(padj_72h < significance_threshold) %>%
+    mutate(
+      z = z_72h,
+      log2FoldChange = log2FoldChange_72h,
+      rank = prank_72h,
+      direction = ifelse(z > 0, "Up-regulated", "Down-regulated")
+    )
+  
+  deg_72h_top <- bind_rows(
+    deg_72h %>% top_n(10, z_72h) %>% mutate(regulation = "Up-regulated"),
+    deg_72h %>% top_n(10, -z_72h) %>% mutate(regulation = "Down-regulated")
+  )
+  
+  rank_72h_plot <- deg_72h %>%
+    ggplot(aes(x = prank_72h, y = z_72h)) +
+    scattermore::geom_scattermore(color = "gray60", alpha = 0.6) + 
+    geom_point(
+      data = deg_72h_significant, 
+      aes(x = rank, y = z, size = abs(z), color = direction),
+      alpha = 0.8
+    ) + 
+    ggrepel::geom_text_repel(
+      data = deg_72h_top, 
+      aes(x = prank_72h, y = z_72h, label = gene), 
+      max.overlaps = Inf,
+      size = 3
+    ) + 
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    scale_color_manual(values = c("Up-regulated" = "tomato", "Down-regulated" = "skyblue")) +
+    labs(
+      x = "Gene Rank",
+      y = "Z-score",
+      title = "72h Timepoint Analysis",
+      color = "Regulation",
+      size = "|Z-score|"
+    ) +
+    theme_miko(legend = TRUE)
+  
+  # Combine time-course plots
+  timecourse_combined <- cowplot::plot_grid(
+    trajectory_plot, 
+    rank_72h_plot, 
+    nrow = 1, 
+    align = "hv", 
+    axis = "tb", 
+    rel_widths = c(2, 1)
+  )
+  
+  timecourse_combined
+  
+} else {
+  cat("Time-course comparison files not found. Skipping time-course analysis.\n")
+}
+```
+
+# ==============================================================================
+# GENE SET ENRICHMENT ANALYSIS (GSEA)
+# ==============================================================================
+
+```{r gsea_analysis}
+# Perform GSEA using ranked gene list
+cat("Running Gene Set Enrichment Analysis...\n")
+
+# Prepare ranked gene list for GSEA
+gsea_input <- deg_dataframe %>%
+  dplyr::arrange(desc(z_score)) %>%
+  dplyr::select(gene, z_score)
+
+# Run GSEA with multiple databases
+gsea_results <- runGSEA(
+  gene = gsea_input$gene, 
+  value = gsea_input$z_score, 
+  species = "Hs", 
+  db = "Bader"  # Can be modified to include other databases
+)
+
+# Extract and display results
+gsea_pathways <- gsea_results$gse.pathway
+
+# Display top enriched pathways
+cat("Top enriched pathways:\n")
+head(gsea_pathways, 10)
+
+# Create GSEA plot
+gsea_plot <- gsea_results[["plt.gsea"]]
+if (!is.null(gsea_plot)) {
+  gsea_plot + 
+    labs(title = "Gene Set Enrichment Analysis") +
+    theme_miko()
+}
+```
+
+# ==============================================================================
+# MEDULLOBLASTOMA NMF PROGRAM VALIDATION
+# ==============================================================================
+
+```{r nmf_program_validation, fig.width=6, fig.height=4}
+# Load previously identified MB NMF programs from scRNA-seq analysis
+cat("Loading medulloblastoma NMF programs for validation...\n")
+
+nmf_programs_file <- "MB_nmf_programs_120225.rds"
+if (file.exists(nmf_programs_file)) {
+  nmf_robust_final <- readRDS(nmf_programs_file)
+  
+  cat("Loaded NMF programs:\n")
+  for (i in 1:length(nmf_robust_final)) {
+    cat("  ", names(nmf_robust_final)[i], ":", length(nmf_robust_final[[i]]), "genes\n")
+  }
+  
+  # Analyze how NMF program genes respond to treatment
+  if (exists("deg_timecourse") && exists("deg_long_z")) {
+    # Use time-course data if available
+    nmf_program_response <- deg_long_z %>%
+      filter(
+        gene %in% c(nmf_robust_final$G1, nmf_robust_final$G2, nmf_robust_final$G3)
+      ) %>%
+      mutate(
+        program = case_when(
+          gene %in% nmf_robust_final$G1 ~ "MB Program 1",
+          gene %in% nmf_robust_final$G2 ~ "MB Program 2", 
+          gene %in% nmf_robust_final$G3 ~ "MB Program 3"
+        )
+      ) %>%
+      filter(!is.na(program))
+    
+    # Statistical tests for each program
+    program_stats <- nmf_program_response %>%
+      filter(timepoint %in% c("24h", "72h")) %>%
+      group_by(program, timepoint) %>%
+      summarise(
+        mean_z = mean(z_score, na.rm = TRUE),
+        se_z = sd(z_score, na.rm = TRUE) / sqrt(n()),
+        p_value = tryCatch({
+          t.test(z_score, mu = 0)$p.value
+        }, error = function(e) NA),
+        .groups = 'drop'
+      )
+    
+    print(program_stats)
+    
+  } else {
+    # Use current timepoint data
+    nmf_program_response <- deg_dataframe %>%
+      filter(
+        gene %in% c(nmf_robust_final$G1, nmf_robust_final$G2, nmf_robust_final$G3)
+      ) %>%
+      mutate(
+        program = case_when(
+          gene %in% nmf_robust_final$G1 ~ "MB Program 1",
+          gene %in% nmf_robust_final$G2 ~ "MB Program 2",
+          gene %in% nmf_robust_final$G3 ~ "MB Program 3"
+        )
+      ) %>%
+      filter(!is.na(program))
+  }
+  
+  # Create visualization of NMF program response
+  nmf_response_plot <- nmf_program_response %>%
+    dplyr::filter(!(timepoint %in% "0h")) %>%
+    ggplot(aes(x = program, y = z_score)) + 
+    geom_boxplot(aes(fill = program), outlier.colour = NA, alpha = 0.7) +   
+    geom_point(
+      # aes(color = significant), 
+      position = position_jitter(width = 0.2),
+      alpha = 0.7
+    ) + 
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") + 
+    scale_color_manual(
+      values = c("TRUE" = "red", "FALSE" = "gray"),
+      name = "Significant"
+    ) +
+    scale_fill_brewer(type = "qual", palette = "Set2") +
+    labs(
+      x = "Medulloblastoma Program", 
+      y = "Z-score (Omo vs Vehicle)",
+      title = "NMF Program Response to Omo Treatment",
+      subtitle = paste("Timepoint:", analysis_timepoint)
+    ) +
+    theme_miko(legend = TRUE) +
+    guides(fill = "none")
+  
+  # If time-course data is available, create faceted plot
+  if (exists("deg_long_z") && "timepoint" %in% colnames(nmf_program_response)) {
+    nmf_response_plot <- nmf_response_plot + 
+      facet_wrap(~timepoint) +
+      labs(subtitle = "Response across timepoints")
+  }
+  
+  print(nmf_response_plot)
+  
+  # Calculate program-level statistics
+  program_summary <- nmf_program_response %>%
+    group_by(program) %>%
+    summarise(
+      n_genes = n(),
+      mean_z = mean(z_score, na.rm = TRUE),
+      median_z = median(z_score, na.rm = TRUE),
+      se_z = sd(z_score, na.rm = TRUE) / sqrt(n()),
+      p_value_t_test = tryCatch({
+        t.test(z_score, mu = 0)$p.value
+      }, error = function(e) NA),
+      direction = ifelse(mean_z > 0, "Up-regulated", "Down-regulated"),
+      .groups = 'drop'
+    )
+  
+  cat("\nNMF Program Summary Statistics:\n")
+  print(program_summary)
+  
+} else {
+  cat("NMF programs file not found. Skipping program validation.\n")
+}
+```
+
+# ==============================================================================
+# RESULTS EXPORT AND SUMMARY
+# ==============================================================================
+
+```{r export_results}
+# Export key results to files
+output_prefix <- paste0("MB02_bulk_rnaseq_", analysis_timepoint, "_", format(Sys.Date(), "%d%m%y"))
+
+# Export differential expression results
+write.csv(
+  deg_dataframe, 
+  file = paste0(output_prefix, "_DEG_results.csv"),
+  row.names = FALSE
+)
+
+# Export significant genes only
+write.csv(
+  deg_significant, 
+  file = paste0(output_prefix, "_significant_genes.csv"),
+  row.names = FALSE
+)
+
+# Export top genes
+write.csv(
+  deg_top_genes, 
+  file = paste0(output_prefix, "_top_genes.csv"),
+  row.names = FALSE
+)
+
+# Save GSEA results if available
+if (exists("gsea_pathways")) {
+  write.csv(
+    gsea_pathways, 
+    file = paste0(output_prefix, "_GSEA_pathways.csv"),
+    row.names = FALSE
+  )
+}
+
+# Save NMF program analysis if available
+if (exists("program_summary")) {
+  write.csv(
+    program_summary, 
+    file = paste0(output_prefix, "_NMF_program_summary.csv"),
+    row.names = FALSE
+  )
+}
+
+# Generate final summary
+cat("BULK RNA-SEQ ANALYSIS SUMMARY\n")
+cat("Analysis timepoint:", analysis_timepoint, "\n")
+cat("Total genes analyzed:", nrow(deg_dataframe), "\n")
+cat("Significantly DE genes:", nrow(deg_significant), "\n")
+cat("Up-regulated genes:", sum(deg_dataframe$direction == "Up-regulated"), "\n")
+cat("Down-regulated genes:", sum(deg_dataframe$direction == "Down-regulated"), "\n")
+
+if (exists("gsea_pathways")) {
+  cat("GSEA pathways identified:", nrow(gsea_pathways), "\n")
+}
+
+if (exists("program_summary")) {
+  cat("NMF programs analyzed:", nrow(program_summary), "\n")
+}
+
+cat("\nKey files exported:\n")
+cat("- DEG results:", paste0(output_prefix, "_DEG_results.csv"), "\n")
+cat("- Significant genes:", paste0(output_prefix, "_significant_genes.csv"), "\n")
+cat("- Top genes:", paste0(output_prefix, "_top_genes.csv"), "\n")
+
+if (exists("gsea_pathways")) {
+  cat("- GSEA results:", paste0(output_prefix, "_GSEA_pathways.csv"), "\n")
+}
+
+cat("\nAnalysis completed successfully!\n")
+cat("Total runtime:", round((proc.time() - start.time)[3], 2), "seconds\n")
+```
+
+# ==============================================================================
+# SESSION INFORMATION
+# ==============================================================================
+
+```{r session_info}
+# Record session information for reproducibility
+sessionInfo()
+```

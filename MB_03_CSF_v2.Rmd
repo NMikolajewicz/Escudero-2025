@@ -1,0 +1,1011 @@
+---
+title: "Medulloblastoma CSF Proteomics Validation Analysis"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+---
+
+# Medulloblastoma CSF Proteomics Analysis
+# This script analyzes CSF proteomics data from medulloblastoma patients (Kim et al. 2024)
+# Validates scRNA-seq derived gene programs and drug targets at the protein level
+# Author: N. Mikolajewicz
+
+# ==============================================================================
+# SETUP AND DEPENDENCIES
+# ==============================================================================
+
+```{r setup, include=FALSE}
+# Clear environment and start timer
+rm(list = setdiff(ls(), c("data.path", "user")))
+invisible({gc()})
+start.time <- proc.time()
+
+# Load required packages
+packages_to_load <- c(
+  "Seurat", "sctransform", "Libra",
+  "dplyr", "tidyr", "RColorBrewer", "ggplot2", "gridExtra", 
+  "DT", "flexdashboard", "future", "biomaRt", "foreach", 
+  "parallel", "doParallel", "scMiko", "reshape2", "glmGamPoi",
+  "readxl"
+)
+invisible({lapply(packages_to_load, library, character.only = TRUE)})
+```
+
+```{r config}
+# Set paths and load pre-computed NMF programs
+base_dir <- "C:/Users/n mikolajewicz/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Medulloblastoma/Kim_2024_CSF/"
+
+# Load NMF programs from previous scRNA-seq analysis
+nmf_programs_file <- "MB_nmf_programs_120225.rds"
+if (file.exists(nmf_programs_file)) {
+  nmf_robust_final <- readRDS(nmf_programs_file)
+  cat("Loaded NMF programs from scRNA-seq analysis\n")
+} else {
+  cat("Warning: NMF programs file not found. Using hardcoded programs.\n")
+  # Hardcoded NMF programs as backup
+  nmf_robust_final <- list(
+    G1 = c('ASPM', 'AURKB', 'BUB1', 'BUB1B', 'CDC25C', 'CDCA2', 'CKAP2L', 
+           'DLGAP5', 'ESCO2', 'ESPL1', 'GTSE1', 'KIF20A', 'KIF23', 'KIF2C', 
+           'KIFC1', 'MKI67', 'NDC80', 'PBK', 'TACC3', 'TROAP', 'TTK'),
+    G2 = c('ATP5F1E', 'BTF3', 'CHCHD2', 'COMMD6', 'COX7A2', 'COX7C', 'EEF1A1', 
+           'ELOB', 'FAU', 'FTH1', 'FTL', 'GAPDH', 'H3F3A', 'HINT1', 'HNRNPA1', 
+           'NACA', 'NDUFS5', 'RACK1', 'SLC25A6', 'SUMO2', 'TMA7', 'TMSB10', 
+           'TMSB4X', 'TPT1', 'UBA52', 'UQCRH', 'YBX1'),
+    G3 = c('CABP5', 'CNGA1', 'CNGB1', 'CPLX4', 'GABRR3', 'GNAT1', 'GNGT1', 
+           'GNGT2', 'GPR160', 'IMPG1', 'KCNV2', 'LMOD1', 'MATK', 'NR2E3', 
+           'PDC', 'PDE6A', 'PDE6B', 'PDE6G', 'PLEKHB1', 'PRCD', 'PRPH2', 
+           'RASSF2', 'RAX2', 'RBP3', 'RCVRN', 'RDH12', 'REEP6', 'ROM1', 
+           'Rp1', 'RTBDN', 'SAG', 'SLC6A17', 'SNCB')
+  )
+}
+
+# Analysis parameters
+detection_threshold <- 0.7  # Protein detection threshold (70% per group)
+significance_threshold <- 0.2  # P-value threshold for differential expression
+fold_change_threshold <- 0.1  # Log fold change threshold
+```
+
+# ==============================================================================
+# DATA IMPORT AND PREPROCESSING
+# ==============================================================================
+
+```{r data_import}
+# Load CSF proteomics data from Kim et al. 2024 Scientific Reports
+cat("Loading CSF proteomics data...\n")
+
+# Load metadata
+metadata <- readxl::read_xlsx(paste0(base_dir, "Kim_2025_ScientificReports_SupTable1.xlsx"))
+metadata <- col2rowname(metadata, "sample")
+metadata$sample_id <- rownames(metadata)
+metadata$sample <- gsub(" [0-9]*", "", metadata$sample_id)
+
+# Load protein intensity data
+protein_data <- readxl::read_xlsx(paste0(base_dir, "Kim_2025_ScientificReports_SupTable2.xlsx"))
+
+cat("Data loaded successfully!\n")
+cat("Samples:", nrow(metadata), "\n")
+cat("Proteins (before deduplication):", nrow(protein_data), "\n")
+cat("Sample types:", paste(unique(metadata$type), collapse = ", "), "\n")
+```
+
+```{r protein_deduplication}
+# Handle duplicate protein entries by averaging intensities
+cat("Deduplicating protein entries...\n")
+
+unique_proteins <- unique(protein_data$gene)
+sample_columns <- colnames(protein_data)[!colnames(protein_data) %in% "gene"]
+
+deduplicated_data <- NULL
+
+for (i in 1:length(unique_proteins)) {
+  current_protein <- unique_proteins[i]
+  protein_subset <- protein_data %>% filter(gene == current_protein)
+  
+  if (nrow(protein_subset) == 1) {
+    # Single entry - keep as is
+    deduplicated_data <- bind_rows(deduplicated_data, protein_subset)
+  } else if (nrow(protein_subset) > 1) {
+    # Multiple entries - average the intensities
+    intensity_matrix <- as.matrix(protein_subset %>% dplyr::select(-gene))
+    averaged_intensities <- apply(
+      apply(intensity_matrix, 2, as.numeric), 
+      2, 
+      mean, 
+      na.rm = TRUE
+    )
+    
+    averaged_row <- data.frame(
+      gene = current_protein,
+      t(averaged_intensities)
+    )
+    colnames(averaged_row) <- colnames(protein_subset)
+    deduplicated_data <- bind_rows(deduplicated_data, averaged_row)
+  }
+}
+
+# Clean and format data
+deduplicated_data <- deduplicated_data[!is.na(deduplicated_data$gene), ]
+protein_matrix <- deduplicated_data %>% 
+  col2rowname("gene")
+
+cat("Proteins after deduplication:", nrow(protein_matrix), "\n")
+```
+
+# ==============================================================================
+# QUALITY CONTROL AND FILTERING
+# ==============================================================================
+
+```{r quality_control}
+# Prepare metadata and create Seurat object
+common_samples <- intersect(colnames(protein_matrix), rownames(metadata))
+metadata_filtered <- metadata[common_samples, ]
+protein_matrix_filtered <- protein_matrix[, common_samples]
+
+# Update sample annotations
+metadata_filtered$subtype <- metadata_filtered$type
+metadata_filtered$subtype[metadata_filtered$sample == "HC"] <- "HC"
+
+# Create Seurat object for proteomics analysis
+rownames(protein_matrix_filtered) <- make.names(make.unique(rownames(protein_matrix_filtered)))
+seurat_csf <- CreateSeuratObject(
+  counts = protein_matrix_filtered, 
+  meta.data = metadata_filtered
+)
+
+cat("Created Seurat object with", ncol(seurat_csf), "samples and", nrow(seurat_csf), "proteins\n")
+
+# Apply detection threshold filtering
+cat("Applying detection threshold filtering...\n")
+
+# Filter proteins based on detection threshold per group
+unique_groups <- unique(as.character(seurat_csf@meta.data$sample))
+expressed_proteins <- c()
+
+for (group in unique_groups) {
+  group_cells <- seurat_csf@meta.data$sample == group
+  group_proteins <- getExpressedGenes(
+    seurat_csf[, group_cells], 
+    min.pct = detection_threshold
+  )
+  expressed_proteins <- c(expressed_proteins, group_proteins)
+}
+
+expressed_proteins <- unique(expressed_proteins)
+seurat_csf <- seurat_csf[rownames(seurat_csf) %in% expressed_proteins, ]
+
+cat("Proteins after filtering:", nrow(seurat_csf), "\n")
+cat("Samples retained:", ncol(seurat_csf), "\n")
+```
+
+# ==============================================================================
+# DETECTION THRESHOLD ANALYSIS
+# ==============================================================================
+
+```{r detection_analysis, fig.width=8, fig.height=6}
+# Analyze protein recovery across different detection thresholds
+cat("Analyzing protein detection thresholds...\n")
+
+detection_thresholds <- seq(0, 1, by = 0.025)
+seurat_all <- CreateSeuratObject(
+  counts = protein_matrix_filtered, 
+  meta.data = metadata_filtered
+)
+
+detection_results <- NULL
+
+for (threshold in detection_thresholds) {
+  unique_groups <- unique(as.character(seurat_all@meta.data$sample))
+  threshold_proteins <- c()
+  
+  for (group in unique_groups) {
+    group_cells <- seurat_all@meta.data$sample == group
+    group_proteins <- getExpressedGenes(
+      seurat_all[, group_cells], 
+      min.pct = threshold
+    )
+    threshold_proteins <- c(threshold_proteins, group_proteins)
+  }
+  
+  threshold_proteins <- unique(threshold_proteins)
+  
+  detection_results <- bind_rows(
+    detection_results,
+    data.frame(
+      detection_threshold = threshold,
+      proteins_detected = length(threshold_proteins)
+    )
+  )
+}
+
+# Create protein recovery plot
+protein_recovery_plot <- detection_results %>%
+  ggplot(aes(x = 100 * detection_threshold, y = proteins_detected)) +
+  geom_point(size = 2) +
+  geom_line() +
+  geom_vline(xintercept = 70, linetype = "dashed", color = "red") + 
+  labs(
+    x = "Protein Detection Threshold (% per diagnostic group)",
+    y = "Number of Unique Proteins Recovered",
+    title = "Protein Recovery vs Detection Threshold",
+    subtitle = "Red line indicates threshold used in analysis"
+  ) +
+  theme_miko(grid = TRUE)
+
+protein_recovery_plot
+```
+
+```{r sample_recovery_analysis, fig.width=8, fig.height=6}
+# Analyze protein recovery per individual sample
+cat("Analyzing protein recovery per sample...\n")
+
+unique_samples <- unique(seurat_all@meta.data$sample_id)
+sample_recovery <- NULL
+
+for (sample_id in unique_samples) {
+  sample_proteins <- getExpressedGenes(
+    seurat_all[, seurat_all@meta.data$sample_id == sample_id], 
+    min.pct = 0  # No threshold for individual samples
+  )
+  
+  sample_recovery <- bind_rows(
+    sample_recovery, 
+    data.frame(
+      sample_id = sample_id,
+      proteins_detected = length(sample_proteins),
+      sample_type = seurat_all@meta.data$subtype[seurat_all@meta.data$sample_id == sample_id][1]
+    )
+  )
+}
+
+# Order sample types logically
+sample_recovery$sample_type <- factor(
+  sample_recovery$sample_type, 
+  levels = c("HC", "WNT", "SHH", "Group3", "Group4")
+)
+
+# Create sample-specific recovery plot
+sample_recovery_plot <- sample_recovery %>%
+  ggplot(aes(x = sample_type, y = proteins_detected, fill = sample_type)) + 
+  geom_boxplot(alpha = 0.7) + 
+  geom_point(position = position_jitter(width = 0.2), size = 2) +
+  scale_fill_brewer(type = "qual", palette = "Set2") +
+  labs(
+    x = "Sample Type", 
+    y = "Number of Proteins Detected",
+    title = "Protein Recovery per Sample",
+    subtitle = "Individual sample-level protein detection"
+  ) +
+  theme_miko() +
+  guides(fill = "none")
+
+sample_recovery_plot
+
+# Statistical summary
+recovery_summary <- sample_recovery %>%
+  group_by(sample_type) %>%
+  summarise(
+    mean_proteins = mean(proteins_detected),
+    sd_proteins = sd(proteins_detected),
+    n_samples = n(),
+    .groups = 'drop'
+  )
+
+print(recovery_summary)
+```
+
+# ==============================================================================
+# DIMENSIONALITY REDUCTION AND VISUALIZATION
+# ==============================================================================
+
+```{r dimensionality_reduction}
+# Standard Seurat processing pipeline adapted for proteomics
+cat("Performing dimensionality reduction...\n")
+
+# Normalization and scaling
+seurat_csf <- NormalizeData(
+  seurat_csf, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+
+seurat_csf <- FindVariableFeatures(
+  seurat_csf, 
+  selection.method = "vst", 
+  nfeatures = 2000
+)
+
+all_proteins <- rownames(seurat_csf)
+seurat_csf <- ScaleData(seurat_csf, features = all_proteins)
+
+# PCA
+n_pcs <- min(50, ncol(seurat_csf) - 1)
+seurat_csf <- RunPCA(
+  seurat_csf, 
+  features = VariableFeatures(seurat_csf), 
+  npcs = n_pcs
+)
+
+# Check PCA variance
+pca_variance <- propVarPCA(seurat_csf)
+
+# Clustering and UMAP
+seurat_csf <- FindNeighbors(seurat_csf, dims = 1:30)
+seurat_csf <- FindClusters(seurat_csf, resolution = 0.5)
+seurat_csf <- RunUMAP(seurat_csf, dims = 1:30)
+
+# Create visualization plots
+umap_by_sample <- cluster.UMAP(seurat_csf, "sample", pt.size = 4) + 
+  theme_miko(color.palette = "ptol", legend = TRUE) + 
+  labs(
+    title = "CSF Proteomics UMAP", 
+    subtitle = paste0("Kim et al (2024) Scientific Reports\nn = ", ncol(seurat_csf), " samples"),
+    color = "Sample Group"
+  )
+
+umap_by_subtype <- cluster.UMAP(seurat_csf, "subtype", pt.size = 4) + 
+  theme_miko(color.palette = "ptol", legend = TRUE) + 
+  labs(
+    title = "CSF Proteomics UMAP", 
+    subtitle = paste0("Kim et al (2024) Scientific Reports\nn = ", ncol(seurat_csf), " samples"),
+    color = "MB Subtype"
+  )
+
+umap_by_sample
+umap_by_subtype
+```
+
+# ==============================================================================
+# DIFFERENTIAL PROTEIN EXPRESSION ANALYSIS
+# ==============================================================================
+
+```{r differential_expression, fig.width=12, fig.height=10}
+# Comprehensive differential expression analysis
+cat("Performing differential protein expression analysis...\n")
+
+# Create combined G3/G4 group for analysis
+seurat_csf@meta.data$subtype2 <- seurat_csf@meta.data$subtype
+seurat_csf@meta.data$subtype2[seurat_csf@meta.data$subtype2 %in% c("Group3", "Group4")] <- "G3_G4"
+
+# Function to label genes with NMF program membership
+label_nmf_programs <- function(data) {
+  data$nmf_program <- "other"
+  data$nmf_program[data$feature %in% nmf_robust_final$G1] <- "NMF1"
+  data$nmf_program[data$feature %in% nmf_robust_final$G2] <- "NMF2"
+  data$nmf_program[data$feature %in% nmf_robust_final$G3] <- "NMF3"
+  return(data)
+}
+
+# Differential expression comparisons
+deg_analyses <- list()
+
+# 1. Overall medulloblastoma vs healthy controls
+deg_analyses$MBL_vs_HC <- getDEG(
+  seurat_csf, 
+  assay = "RNA", 
+  group_by = "sample", 
+  return.list = FALSE, 
+  return.all = TRUE
+) %>% 
+  filter(group == "MBL") %>%
+  label_nmf_programs()
+
+# 2. Individual subtypes vs healthy controls
+subtype_comparisons <- c("WNT", "SHH", "Group3", "Group4")
+for (subtype in subtype_comparisons) {
+  comparison_samples <- seurat_csf@meta.data$subtype %in% c("HC", subtype)
+  deg_analyses[[paste0(subtype, "_vs_HC")]] <- getDEG(
+    seurat_csf[, comparison_samples], 
+    assay = "RNA", 
+    group_by = "subtype", 
+    return.list = FALSE, 
+    return.all = TRUE
+  ) %>% 
+    filter(group == subtype) %>%
+    label_nmf_programs()
+}
+
+# 3. Combined G3/G4 vs healthy controls
+g34_samples <- seurat_csf@meta.data$subtype2 %in% c("HC", "G3_G4")
+deg_analyses$G34_vs_HC <- getDEG(
+  seurat_csf[, g34_samples], 
+  assay = "RNA", 
+  group_by = "subtype2", 
+  return.list = FALSE, 
+  return.all = TRUE
+) %>% 
+  filter(group == "G3_G4") %>%
+  label_nmf_programs()
+
+# 4. Subtypes vs other subtypes (excluding HC)
+mb_only_samples <- seurat_csf@meta.data$subtype != "HC"
+for (subtype in subtype_comparisons) {
+  deg_analyses[[paste0(subtype, "_vs_other_MB")]] <- getDEG(
+    seurat_csf[, mb_only_samples], 
+    assay = "RNA", 
+    group_by = "subtype", 
+    return.list = FALSE, 
+    return.all = TRUE
+  ) %>% 
+    filter(group == subtype) %>%
+    label_nmf_programs()
+}
+
+# Combine results with control information
+deg_vs_hc <- bind_rows(
+  deg_analyses$WNT_vs_HC,
+  deg_analyses$SHH_vs_HC,
+  deg_analyses$Group3_vs_HC,
+  deg_analyses$Group4_vs_HC,
+  deg_analyses$G34_vs_HC,
+  deg_analyses$MBL_vs_HC
+) %>%
+  mutate(control_type = "HC")
+
+deg_vs_other <- bind_rows(
+  deg_analyses$WNT_vs_other_MB,
+  deg_analyses$SHH_vs_other_MB,
+  deg_analyses$Group3_vs_other_MB,
+  deg_analyses$Group4_vs_other_MB
+) %>%
+  mutate(control_type = "other_MB")
+
+cat("Differential expression analysis completed.\n")
+cat("Comparisons performed:", length(deg_analyses), "\n")
+```
+
+# ==============================================================================
+# VOLCANO PLOT VISUALIZATIONS
+# ==============================================================================
+
+```{r volcano_plots, fig.width=15, fig.height=12}
+# Create comprehensive volcano plot visualizations
+cat("Creating volcano plots...\n")
+
+# Volcano plot parameters
+label_size <- 3
+n_labels <- 30
+
+# Function to create standardized volcano plots
+create_volcano_plot <- function(deg_data, title, subtitle = NULL) {
+  miko_volcano(
+    deg_data, 
+    rank.by = "pval", 
+    show.n = n_labels, 
+    label.size = label_size,
+    sig.threshold = significance_threshold
+  ) + 
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = "Log2 Fold Change"
+    ) +
+    theme_miko()
+}
+
+# Generate volcano plots for key comparisons
+volcano_plots <- list(
+  MBL = create_volcano_plot(
+    deg_analyses$MBL_vs_HC,
+    "Medulloblastoma vs Healthy Controls",
+    "All MB subtypes combined"
+  ),
+  
+  G3_vs_HC = create_volcano_plot(
+    deg_analyses$Group3_vs_HC,
+    "Group 3 Medulloblastoma vs Healthy Controls",
+    "CSF proteomics validation"
+  ),
+  
+  G4_vs_HC = create_volcano_plot(
+    deg_analyses$Group4_vs_HC,
+    "Group 4 Medulloblastoma vs Healthy Controls",
+    "CSF proteomics validation"
+  ),
+  
+  G34_vs_HC = create_volcano_plot(
+    deg_analyses$G34_vs_HC,
+    "Group 3/4 Medulloblastoma vs Healthy Controls",
+    "Combined G3/G4 analysis"
+  ),
+  
+  G3_vs_other = create_volcano_plot(
+    deg_analyses$Group3_vs_other_MB,
+    "Group 3 vs Other MB Subtypes",
+    "Subtype-specific differences"
+  ),
+  
+  G4_vs_other = create_volcano_plot(
+    deg_analyses$Group4_vs_other_MB,
+    "Group 4 vs Other MB Subtypes",
+    "Subtype-specific differences"
+  )
+)
+
+# Display key volcano plots
+volcano_plots$MBL
+volcano_plots$G34_vs_HC
+volcano_plots$G3_vs_other
+volcano_plots$G4_vs_other
+```
+
+# ==============================================================================
+# MYC-ASSOCIATED GENE VALIDATION
+# ==============================================================================
+
+```{r myc_validation, fig.width=8, fig.height=12}
+# Validate MYC-associated genes from scRNA-seq analysis in CSF proteomics
+cat("Validating MYC-associated genes...\n")
+which_subtype <- c("G3", "G4") # select which MYC associations to include (G3, G4)
+
+# Load MYC-associated genes from previous analysis
+myc_file <- "MB_01_MYC_cdi_scores_180425.rds"
+if (file.exists(myc_file)) {
+  df.map <- readRDS("MB_01_sample_subtype_mapping.rds")
+  df.map <- df.map %>% dplyr::filter(subtype %in% which_subtype)
+  myc_data <- readRDS(myc_file)
+  myc_data[["raw"]] <- myc_data[["raw"]] %>% 
+    dplyr::filter(sample %in% as.character(df.map$sample))
+  
+  myc_data[["sum"]] <- myc_data[["raw"]] %>%
+  dplyr::group_by(feature.y) %>%
+  dplyr::summarise(
+    ncdi.mean = mean(ncdi, na.rm = T),
+    ncdi.median = median(ncdi, na.rm = T),
+    ncdi.sd = sd(ncdi, na.rm = T),
+    ncdi.n = length(ncdi)
+  ) %>%
+  dplyr::mutate(n.cdi.zscore = ncdi.mean/(ncdi.sd / sqrt(ncdi.n)))
+  
+  myc_summary <- myc_data[["sum"]]
+  myc_summary$feature <- myc_summary$feature.y
+  
+  # Calculate statistical measures
+  myc_summary$n_cdi_zscore <- myc_summary$ncdi.mean / myc_summary$ncdi.sd
+  myc_summary$pval <- z2p(myc_summary$n_cdi_zscore)
+  myc_summary$fdr <- p.adjust(myc_summary$pval, method = "BH")
+  
+  # Filter for robust associations
+  n.thresh <- 30
+  if (length(which_subtype) == 1) n.thresh <- 10
+  myc_robust <- myc_summary %>% 
+    filter(ncdi.n > n.thresh) %>%
+    mutate(rank = rank(ncdi.mean, ties.method = "random"))
+  
+  # Identify top MYC-associated genes
+  myc_top <- bind_rows(
+    myc_robust %>% top_n(30, ncdi.mean),
+    myc_robust %>% filter(feature.y %in% c("IMPDH2", "TKT"))  # Gene of specific interest
+  ) %>%
+    distinct()
+  
+  # Create MYC association ranking plot
+  myc_ranking_plot <- myc_robust %>%
+    arrange(rank) %>%
+    ggplot(aes(x = rank, y = ncdi.mean)) + 
+    geom_point(alpha = 0.6) + 
+    ggrepel::geom_text_repel(
+      data = myc_top, 
+      aes(x = rank, y = ncdi.mean, label = feature.y),
+      max.overlaps = Inf, 
+      size = 2.5, 
+      color = "tomato"
+    ) +
+    labs(
+      x = "Gene Rank", 
+      y = "MYC Association (nCDI Mean)",
+      title = "MYC-Associated Genes from scRNA-seq",
+      subtitle = "Ranked by strength of association"
+    ) +
+    theme_miko()
+  
+  print(myc_ranking_plot)
+  
+  cat("MYC-associated genes loaded:", nrow(myc_robust), "\n")
+  cat("Top MYC-associated genes identified:", nrow(myc_top), "\n")
+  
+} else {
+  cat("Warning: MYC association file not found. Skipping MYC validation.\n")
+  myc_summary <- NULL
+}
+
+
+# savePDF("MB_03_CSF_G3_MYC_associations_020625.pdf", myc_ranking_plot, fig.width=5, fig.height=12)
+```
+
+
+
+
+
+# ==============================================================================
+# SCRNA-SEQ VS CSF PROTEOMICS INTEGRATION
+# ==============================================================================
+
+```{r scrna_csf_integration, fig.width=15 * 0.75, fig.height=6 * 0.75}
+# Integrate scRNA-seq MYC associations with CSF proteomics results
+if (!is.null(myc_summary)) {
+  cat("Integrating scRNA-seq and CSF proteomics results...\n")
+  myc_summary2 <- myc_summary
+  myc_summary2$feature <- myc_summary2$feature.y
+  
+  # Function to create integration plots
+  create_integration_plot <- function(deg_data, comparison_name, subtitle) {
+     merged_data <- merge(myc_summary2, deg_data, by = "feature")
+    merged_data <- merge(myc_summary2, deg_data, by = "feature") %>%
+      dplyr::filter(
+        pval.y < 0.05,
+        logFC > 0,
+        n_cdi_zscore > 0,
+        ncdi.n > 10
+      ) %>%
+      dplyr::mutate(product_score = ncdi.mean * logFC)
+    
+    if (nrow(merged_data) > 0) {
+      merged_data %>%
+        ggplot(aes(x = ncdi.mean, y = logFC, color = product_score)) + 
+        geom_hline(yintercept = 0, linetype = "dashed") + 
+        geom_vline(xintercept = 0, linetype = "dashed") + 
+        geom_point(size = 2, alpha = 0.8) + 
+        ggrepel::geom_text_repel(
+          aes(label = feature), 
+          max.overlaps = Inf,
+          size = 3
+        ) + 
+        # scale_color_viridis_c() +
+        labs(
+          x = "MYC Association Score (in G4-MB)\n(nCDI from scRNA-seq)",
+          y = "CSF Protein Log2 Fold Change\n(MB vs Control)",
+          title = paste("scRNA-seq MYC Association vs CSF Proteomics"),
+          subtitle = subtitle,
+          color = "Integration\nScore"
+        ) + 
+        theme_miko(legend = TRUE)
+    } else {
+      NULL
+    }
+  }
+  
+  deg_analyses$Group3_vs_other_MB$pval_deg <- deg_analyses$Group3_vs_other_MB$pval
+  deg_analyses$Group3_vs_HC$pval_deg <- deg_analyses$Group3_vs_HC$pval
+  
+  # Create integration plots for key comparisons
+  integration_plots <- list(
+    G3_vs_all = create_integration_plot(
+      deg_analyses$Group3_vs_other_MB,
+      "Group 3 MB",
+      "G3-MB vs all other MB subtypes"
+    ),
+    
+    G3_vs_HC = create_integration_plot(
+      deg_analyses$Group3_vs_HC,
+      "Group 3 MB", 
+      "G3-MB vs healthy controls"
+    )
+  )
+  
+  # Display integration plots
+  integration_combined <- cowplot::plot_grid(
+    plotlist = integration_plots[!sapply(integration_plots, is.null)], 
+    nrow = 1
+  )
+  integration_combined
+  
+  # savePDF("MB_03_G3MB_CSF_vs_MYC_scRNAseq_G34MB_180425.pdf", integration_combined, fig.width=15 * 0.75, fig.height=6 * 0.75)
+  
+  if (!is.null(integration_combined)) {
+    integration_combined
+  }
+  
+} else {
+  cat("Skipping integration analysis due to missing MYC data.\n")
+}
+```
+
+# ==============================================================================
+# METABOLIC PATHWAY ANALYSIS
+# ==============================================================================
+
+```{r metabolic_analysis, fig.width=15, fig.height=8}
+# Analyze purine and pyrimidine metabolism pathways in CSF proteomics
+cat("Analyzing metabolic pathways...\n")
+
+# Get KEGG pathway gene sets
+symbol_to_entrez <- sym2entrez(rownames(seurat_csf), my.species = "Hs")
+symbol_to_entrez <- symbol_to_entrez[complete.cases(symbol_to_entrez), ]
+
+entrez_to_symbol <- symbol_to_entrez$SYMBOL
+names(entrez_to_symbol) <- as.character(symbol_to_entrez$ENTREZID)
+
+# Get KEGG pathways
+kegg_pathways <- getAnnotationPathways(
+  query.genes = symbol_to_entrez$ENTREZID, 
+  db = 'KEGG'
+)
+
+kegg_pathways <- lapply(kegg_pathways, function(x) {
+  symbols <- entrez_to_symbol[as.character(x)]
+  symbols[!is.na(symbols)]
+})
+
+# Focus on metabolism pathways
+metabolism_pathways <- list(
+  pyrimidine_metabolism = kegg_pathways$KEGG_PYRIMIDINE_METABOLISM,
+  purine_metabolism = kegg_pathways$KEGG_PURINE_METABOLISM
+)
+
+# Score metabolic pathways
+metabolic_scores <- runMS(
+  object = seurat_csf, 
+  genelist = metabolism_pathways, 
+  return.plots = FALSE
+)
+
+# Create metabolism-focused Seurat object
+metabolism_proteins <- rownames(seurat_csf)[
+  rownames(seurat_csf) %in% unique(unlist(metabolism_pathways))
+]
+
+if (length(metabolism_proteins) > 5) {
+  seurat_metabolism <- CreateSeuratObject(
+    counts = protein_matrix_filtered[metabolism_proteins, ], 
+    meta.data = metadata_filtered
+  )
+  
+  # Process metabolism-focused object
+  seurat_metabolism <- NormalizeData(seurat_metabolism)
+  seurat_metabolism <- FindVariableFeatures(seurat_metabolism, nfeatures = length(metabolism_proteins))
+  seurat_metabolism <- ScaleData(seurat_metabolism, features = rownames(seurat_metabolism))
+  
+  n_pcs_metab <- min(nrow(seurat_metabolism) - 1, ncol(seurat_metabolism) - 1)
+  seurat_metabolism <- RunPCA(seurat_metabolism, npcs = n_pcs_metab)
+  seurat_metabolism <- FindNeighbors(seurat_metabolism, dims = 1:n_pcs_metab)
+  seurat_metabolism <- FindClusters(seurat_metabolism, resolution = 0.5)
+  seurat_metabolism <- RunUMAP(seurat_metabolism, dims = 1:n_pcs_metab)
+  
+  # Visualize metabolic protein expression
+  metabolism_expression <- as.data.frame(
+    t(seurat_csf@assays[["RNA"]]@scale.data[unlist(metabolism_pathways), ])
+  )
+  metabolism_expression$subtype <- seurat_csf@meta.data$subtype
+  
+  which_prot <- unlist(metabolism_pathways)
+  which_prot <- which_prot[which_prot %in% colnames(metabolism_expression)]
+  select = dplyr::select
+  metabolism_long <- metabolism_expression %>%
+    pivot_longer(
+      cols = as.character(which_prot),
+      names_to = "protein",
+      values_to = "expression"
+    ) %>%
+    dplyr::mutate(
+      subtype = factor(subtype, levels = c("HC", "WNT", "SHH", "Group3", "Group4"))
+    )
+  
+  # Individual protein expression plot
+  metabolism_boxplot <- metabolism_long %>%
+    dplyr::filter(protein %in% c('AK1', 'GDA', 'HPRT1', 'PKM', 'PNP')) %>%
+    ggplot(aes(x = subtype, y = expression)) + 
+    geom_hline(yintercept = 0, linetype = "dashed") + 
+    geom_boxplot(fill = "lightgray", alpha = 0.7) + 
+    geom_point(position = position_jitter(width = 0.2), alpha = 0.6) + 
+    facet_wrap(~protein, scales = "free_y") + 
+    labs(
+      x = "Sample Type", 
+      y = "Protein Expression (Scaled)",
+      title = "Metabolic Pathway Proteins in CSF",
+      subtitle = "Purine and pyrimidine metabolism"
+    ) +
+    theme_miko(x.axis.rotation = 45)
+  
+  # Summary heatmap
+  metabolism_summary <- metabolism_long %>% 
+    group_by(subtype, protein) %>%
+    summarise(mean_expression = mean(expression, na.rm = TRUE), .groups = 'drop') %>%
+    pivot_wider(names_from = subtype, values_from = mean_expression)
+  metabolism_summary <- col2rowname(metabolism_summary, "protein")
+  
+  metabolism_heatmap <- miko_heatmap(
+    metabolism_summary, 
+    scale = "none",
+    main = "Metabolic Pathway Protein Expression"
+  )
+  
+  # UMAP plots
+  metabolism_umap_sample <- cluster.UMAP(seurat_metabolism, group.by = "sample", pt.size = 4) + 
+    labs(
+      title = "Metabolic Pathway UMAP", 
+      subtitle = "Purine/pyrimidine metabolism discrimination",
+      color = "Sample Group"
+    )
+  
+  metabolism_umap_subtype <- cluster.UMAP(seurat_metabolism, group.by = "subtype", pt.size = 4) + 
+    labs(
+      title = "Metabolic Pathway UMAP", 
+      subtitle = "Purine/pyrimidine metabolism discrimination",
+      color = "MB Subtype"
+    )
+  
+  # Display metabolic analyses
+  metabolism_boxplot
+  # savePDF("MB_03_CSF_v2_purine_protein_by_MB_subtype_020625.pdf", metabolism_boxplot, fig.width = 8, fig.height = 5)
+  metabolism_heatmap
+  
+  metabolism_combined <- cowplot::plot_grid(
+    metabolism_umap_sample, 
+    metabolism_umap_subtype, 
+    nrow = 1
+  )
+  metabolism_combined
+  
+} else {
+  cat("Insufficient metabolic pathway proteins detected in CSF data.\n")
+}
+```
+
+
+# ==============================================================================
+# PATHWAY ENRICHMENT ANALYSIS
+# ==============================================================================
+
+```{r pathway_enrichment, fig.width=8, fig.height=6}
+# Perform pathway enrichment analysis on differentially expressed proteins
+cat("Performing pathway enrichment analysis...\n")
+
+# Use G3/G4 vs HC comparison for enrichment
+enrichment_data <- deg_analyses$G34_vs_HC
+enrichment_threshold <- significance_threshold
+fold_change_threshold_enrich <- 0
+
+# Create gene lists for enrichment
+enrichment_gene_lists <- list(
+  upregulated = enrichment_data$feature[
+    enrichment_data$padj < enrichment_threshold & 
+    enrichment_data$logFC > fold_change_threshold_enrich
+  ],
+  downregulated = enrichment_data$feature[
+    enrichment_data$padj < enrichment_threshold & 
+    enrichment_data$logFC < -fold_change_threshold_enrich
+  ]
+)
+
+# Run hypergeometric enrichment test
+if (length(enrichment_gene_lists$upregulated) > 5 || length(enrichment_gene_lists$downregulated) > 5) {
+  enrichment_results <- runHG(
+    gene.list = enrichment_gene_lists, 
+    gene.universe = rownames(seurat_csf), 
+    e2s = TRUE,
+    species = "Hs", 
+    pathway.db = "KEGG"
+  )
+  
+  enrichment_summary <- summarizeHG(enrichment_results, show.n = 10)
+  
+  # Display enrichment results
+  if (!is.null(enrichment_summary$plots)) {
+    enrichment_plots <- enrichment_summary$plots
+    
+    # Display plots
+    for (i in 1:length(enrichment_plots)) {
+      print(enrichment_plots[[i]])
+    }
+    
+    # Print pathway results
+    pathway_results <- enrichment_summary[["results"]]
+    if (!is.null(pathway_results)) {
+      pathway_results$overlapGenes <- unlist(pathway_results$overlapGenes)
+      
+      cat("Top enriched pathways:\n")
+      print(head(pathway_results[, c("pathway", "pval", "padj", "overlapGenes")], 10))
+    }
+  }
+  
+} else {
+  cat("Insufficient differentially expressed proteins for enrichment analysis.\n")
+}
+```
+
+
+# ==============================================================================
+# RESULTS EXPORT AND SUMMARY
+# ==============================================================================
+
+```{r export_results}
+# Export comprehensive results
+output_prefix <- paste0("MB03_CSF_proteomics_", format(Sys.Date(), "%d%m%y"))
+
+# Export differential expression results
+write.csv(
+  deg_vs_hc, 
+  file = paste0(output_prefix, "_DEG_vs_HC.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  deg_vs_other, 
+  file = paste0(output_prefix, "_DEG_vs_other_MB.csv"),
+  row.names = FALSE
+)
+
+# Export protein recovery analysis
+write.csv(
+  detection_results, 
+  file = paste0(output_prefix, "_protein_detection_analysis.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  sample_recovery, 
+  file = paste0(output_prefix, "_sample_protein_recovery.csv"),
+  row.names = FALSE
+)
+
+# Export integration results if available
+if (!is.null(myc_summary)) {
+  write.csv(
+    myc_summary, 
+    file = paste0(output_prefix, "_MYC_associations.csv"),
+    row.names = FALSE
+  )
+}
+
+# Export pathway enrichment results if available
+if (exists("pathway_results")) {
+  write.csv(
+    pathway_results, 
+    file = paste0(output_prefix, "_pathway_enrichment.csv"),
+    row.names = FALSE
+  )
+}
+
+# Generate comprehensive summary
+cat("CSF PROTEOMICS ANALYSIS SUMMARY\n")
+cat("Dataset: Kim et al. (2024) Scientific Reports\n")
+cat("Total samples analyzed:", ncol(seurat_csf), "\n")
+cat("Total proteins analyzed:", nrow(seurat_csf), "\n")
+cat("Detection threshold:", detection_threshold * 100, "%\n")
+cat("Sample types:", paste(unique(seurat_csf@meta.data$subtype), collapse = ", "), "\n")
+
+cat("\nDifferential Expression Summary:\n")
+cat("- Comparisons performed:", length(deg_analyses), "\n")
+
+for (comparison in names(deg_analyses)) {
+  sig_proteins <- sum(deg_analyses[[comparison]]$padj < significance_threshold, na.rm = TRUE)
+  cat("- ", comparison, ":", sig_proteins, "significant proteins\n")
+}
+
+if (exists("metabolism_proteins")) {
+  cat("\nMetabolic Pathway Analysis:\n")
+  cat("- Metabolism proteins detected:", length(metabolism_proteins), "\n")
+}
+
+if (!is.null(myc_summary)) {
+  myc_in_csf <- sum(myc_summary$feature %in% rownames(seurat_csf))
+  cat("\nMYC Association Validation:\n")
+  cat("- MYC-associated genes in CSF:", myc_in_csf, "/", nrow(myc_summary), "\n")
+}
+
+cat("\nKey files exported:\n")
+cat("- Differential expression results\n")
+cat("- Protein detection analysis\n") 
+cat("- Sample recovery statistics\n")
+
+if (!is.null(myc_summary)) {
+  cat("- MYC association validation\n")
+}
+
+if (exists("pathway_results")) {
+  cat("- Pathway enrichment results\n")
+}
+
+cat("\nAnalysis completed successfully!\n")
+cat("Total runtime:", round((proc.time() - start.time)[3], 2), "seconds\n")
+```
+
+# ==============================================================================
+# SESSION INFORMATION
+# ==============================================================================
+
+```{r session_info}
+# Record session information for reproducibility
+sessionInfo()
+```
